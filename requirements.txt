@@ -1,0 +1,11 @@
+torch>=2.4
+coremltools>=8.0
+numpy>=1.24
+safetensors>=0.4
+huggingface_hub>=0.24
+transformers>=4.44
+pyyaml>=6.0
+# ResembleAI's chatterbox package (provides T3 / S3Gen / vocoder PyTorch modules)
+# Install from source — not on PyPI under this name at time of writing:
+#   pip install git+https://github.com/resemble-ai/chatterbox.git
+chatterbox @ git+https://github.com/resemble-ai/chatterbox.git
