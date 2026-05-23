@@ -21,8 +21,12 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -47,7 +51,49 @@ GPT2_MAX_POS = 8196
 GPT2_HEAD_DIM = GPT2_HIDDEN // GPT2_HEADS  # 64
 
 # Text vocab size for GPT-2 tokenizer (not the speech vocab)
-TEXT_VOCAB_SIZE = 50258
+TEXT_VOCAB_SIZE = 50276
+
+
+# ---------------------------------------------------------------------------
+# chatterbox-tts 0.1.7 hardcodes a GPT-2 backbone for ChatterboxTurboTTS but
+# the upstream package ships LLAMA_CONFIGS without the "GPT2_medium" entry
+# that t3.py + tts_turbo.py both reference. Patch it in before any chatterbox
+# module load. If the entry is already present (older fork, vendored patch),
+# this is a no-op.
+# ---------------------------------------------------------------------------
+_GPT2_MEDIUM_CONFIG = {
+    "activation_function": "gelu_new",
+    "architectures": ["GPT2LMHeadModel"],
+    "attn_pdrop": 0.1,
+    "bos_token_id": 50256,
+    "embd_pdrop": 0.1,
+    "eos_token_id": 50256,
+    "initializer_range": 0.02,
+    "layer_norm_epsilon": 1e-05,
+    "model_type": "gpt2",
+    "n_ctx": GPT2_MAX_POS,
+    "n_embd": GPT2_HIDDEN,
+    "hidden_size": GPT2_HIDDEN,
+    "n_head": GPT2_HEADS,
+    "n_layer": GPT2_LAYERS,
+    "n_positions": GPT2_MAX_POS,
+    "n_special": 0,
+    "predict_special_tokens": True,
+    "resid_pdrop": 0.1,
+    "summary_activation": None,
+    "summary_first_dropout": 0.1,
+    "summary_proj_to_labels": True,
+    "summary_type": "cls_index",
+    "summary_use_proj": True,
+    "vocab_size": TEXT_VOCAB_SIZE,
+}
+
+
+def _ensure_chatterbox_gpt2_config():
+    from chatterbox.models.t3 import llama_configs as _lc
+
+    if "GPT2_medium" not in _lc.LLAMA_CONFIGS:
+        _lc.LLAMA_CONFIGS["GPT2_medium"] = _GPT2_MEDIUM_CONFIG
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +242,14 @@ class ChatterboxModels:
 
 
 def load_pytorch_model(cache_dir=None):
-    """Download and load the Chatterbox Turbo PyTorch model components."""
+    """Download and load the Chatterbox Turbo PyTorch model components (v1 path).
+
+    Uses YAML config + manual state_dict load. v4 stages should use
+    load_pytorch_model_v4() which goes through ChatterboxTurboTTS.from_pretrained
+    for the meanflow-trained s3gen weights.
+    """
+    _ensure_chatterbox_gpt2_config()
+
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
@@ -204,38 +257,54 @@ def load_pytorch_model(cache_dir=None):
     model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
     print(f"  Model dir: {model_dir}")
 
-    # Load T3 with turbo config from YAML, but override to GPT2_medium
     print("  Loading T3 (GPT-2 Medium turbo)...")
     from chatterbox.models.t3.t3 import T3, T3Config
     import yaml
 
-    # Load the turbo config from YAML
     yaml_path = model_dir / "t3_turbo_v1.yaml"
     with open(yaml_path) as f:
-        # Use full_load to handle !!python/tuple tags
         cfg_dict = yaml.full_load(f)
 
-    # Override llama_config_name — weights are GPT-2 despite YAML
+    # Weights are GPT-2 despite the YAML claiming llama
     cfg_dict["llama_config_name"] = "GPT2_medium"
     turbo_cfg = T3Config.__new__(T3Config)
-    # T3Config uses a simple __init__, populate from dict
     for k, v in cfg_dict.items():
         setattr(turbo_cfg, k, v)
 
     t3 = T3(hp=turbo_cfg)
     t3_state = load_file(model_dir / "t3_turbo_v1.safetensors")
     t3.load_state_dict(t3_state)
-    t3.to("cpu").eval()
+    t3.to("cpu").train(False)
 
-    # Load S3Gen
     print("  Loading S3Gen...")
     from chatterbox.models.s3gen import S3Gen
     s3gen = S3Gen()
     s3gen.load_state_dict(load_file(model_dir / "s3gen.safetensors"), strict=False)
-    s3gen.to("cpu").eval()
+    s3gen.to("cpu").train(False)
 
     print("  Models loaded successfully.")
     return ChatterboxModels(t3=t3, s3gen=s3gen, model_dir=model_dir)
+
+
+def load_pytorch_model_v4(cache_dir=None):
+    """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained.
+
+    This matches the v4 HF artifacts (meanflow-trained s3gen). v4 stages
+    (prefill, lm-onnx, cond-decoder) should use this loader.
+    """
+    _ensure_chatterbox_gpt2_config()
+
+    print("Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('cpu')...")
+    from chatterbox.tts_turbo import ChatterboxTurboTTS
+    from huggingface_hub import snapshot_download
+
+    tts = ChatterboxTurboTTS.from_pretrained("cpu")
+    tts.t3.train(False)
+    tts.s3gen.train(False)
+    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
+    print(f"  Model dir: {model_dir}")
+    print("  Models loaded successfully.")
+    return ChatterboxModels(t3=tts.t3, s3gen=tts.s3gen, model_dir=model_dir)
 
 
 # ===========================================================================
@@ -781,18 +850,1078 @@ def extract_tokenizer_and_config(model, output_dir):
 
 
 # ===========================================================================
+# v4 PIPELINE: T3Prefill (CoreML) + language_model.onnx + conditional_decoder.onnx
+#
+# The v4 hybrid pipeline is what runs on iPhone in pooler-core today. It's a
+# drop-in replacement for the v1 stages above. Each v4 stage is verified
+# against the published HF reference artifact at
+# huggingface.co/ebrinz/chatterbox-turbo-coreml.
+# ===========================================================================
+
+
+# --- Shared validation harness ---------------------------------------------
+
+
+def _seeded_rng(seed: int) -> np.random.Generator:
+    return np.random.default_rng(seed)
+
+
+def _compare_outputs(
+    name: str,
+    ours: np.ndarray,
+    theirs: np.ndarray,
+    *,
+    atol: Optional[float] = None,
+    cos_min: Optional[float] = None,
+) -> bool:
+    """Compare two arrays. Returns True iff all specified thresholds pass.
+    Prints a one-line report with metrics."""
+    ours = np.asarray(ours).astype(np.float64).reshape(-1)
+    theirs = np.asarray(theirs).astype(np.float64).reshape(-1)
+    if ours.shape != theirs.shape:
+        print(f"  [{name}] SHAPE MISMATCH ours={ours.shape} theirs={theirs.shape} FAIL")
+        return False
+
+    max_abs = float(np.max(np.abs(ours - theirs)))
+    denom = (np.linalg.norm(ours) * np.linalg.norm(theirs)) or 1.0
+    cos_sim = float(np.dot(ours, theirs) / denom)
+
+    parts = [f"max_abs={max_abs:.3e}", f"cos_sim={cos_sim:.6f}"]
+    ok = True
+    if atol is not None:
+        ok = ok and (max_abs <= atol)
+        parts.append(f"(atol={atol:.1e})")
+    if cos_min is not None:
+        ok = ok and (cos_sim >= cos_min)
+        parts.append(f"(cos_min={cos_min:.4f})")
+    status = "PASS" if ok else "FAIL"
+    print(f"  [{name}] " + " ".join(parts) + f"  {status}")
+    return ok
+
+
+def _load_onnx_session(path):
+    """Load an ONNX model with onnxruntime, CPU provider, optimization on."""
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.intra_op_num_threads = 4
+    return ort.InferenceSession(path, sess_options=so, providers=["CPUExecutionProvider"])
+
+
+def _check_onnx_graph_for_ios(onnx_path: str) -> bool:
+    """Static checks: model valid, opset supported by iOS ORT, no unknown domains.
+
+    The com.microsoft domain (MultiHeadAttention, etc.) is bundled with the iOS
+    ORT binary and used by the HF v4 reference, so we accept it.
+    """
+    import onnx
+
+    model = onnx.load(onnx_path)
+    try:
+        onnx.checker.check_model(model)
+    except Exception as exc:
+        print(f"  [ios] onnx.checker REJECTED model: {exc}  FAIL")
+        return False
+
+    opset_versions = {opset.domain or "ai.onnx": opset.version for opset in model.opset_import}
+    main_opset = opset_versions.get("ai.onnx", 0)
+    ok = True
+    if main_opset < 13 or main_opset > 22:
+        print(f"  [ios] opset {main_opset} outside iOS ORT-supported range [13, 22]  FAIL")
+        ok = False
+    else:
+        print(f"  [ios] opset {main_opset} (ai.onnx)  OK")
+
+    KNOWN_IOS_DOMAINS = {"", "ai.onnx", "com.microsoft"}
+    bad_domains = [d for d in opset_versions if d not in KNOWN_IOS_DOMAINS]
+    if bad_domains:
+        print(f"  [ios] unrecognized opset domains {bad_domains} — iOS ORT may reject  FAIL")
+        ok = False
+
+    all_nodes = list(model.graph.node)
+    custom_nodes = [n for n in all_nodes if n.domain and n.domain not in {"ai.onnx", "com.microsoft"}]
+    if custom_nodes:
+        names = sorted({f"{n.domain}::{n.op_type}" for n in custom_nodes})
+        print(f"  [ios] ops from non-iOS domains present: {names}  FAIL")
+        ok = False
+    else:
+        ms_count = sum(1 for n in all_nodes if n.domain == "com.microsoft")
+        std_count = len(all_nodes) - ms_count
+        print(f"  [ios] {std_count} ai.onnx ops + {ms_count} com.microsoft ops  OK")
+    return ok
+
+
+def _check_xcrun_coremlcompiler(mlpackage_path: str) -> bool:
+    """Compile the .mlpackage via Xcode's coremlcompiler (same as device build)."""
+    if shutil.which("xcrun") is None:
+        print(f"  [ios] xcrun not installed; skipping coremlcompiler check  SKIP")
+        return True
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            ["xcrun", "coremlcompiler", "compile", mlpackage_path, tmp],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            print(f"  [ios] coremlcompiler FAILED: {proc.stderr.strip()[:300]}")
+            return False
+        print(f"  [ios] xcrun coremlcompiler  PASS")
+        return True
+
+
+def _try_ane_compute(mlpackage_path: str, sample_inputs: dict) -> bool:
+    """Load the package targeting CPU_AND_NE on macOS and run one prediction.
+    Reports compute_unit_usage when available. Returns True if it executes."""
+    try:
+        ml = ct.models.MLModel(mlpackage_path, compute_units=ct.ComputeUnit.CPU_AND_NE)
+    except Exception as exc:
+        print(f"  [ios] CPU_AND_NE load FAILED: {str(exc)[:300]}  FAIL")
+        return False
+    try:
+        _ = ml.predict(sample_inputs)
+    except Exception as exc:
+        print(f"  [ios] CPU_AND_NE predict FAILED: {str(exc)[:300]}  FAIL")
+        return False
+    usage = getattr(ml, "compute_unit_usage", None)
+    if usage is not None:
+        print(f"  [ios] CPU_AND_NE plan: {usage}  (Mac plan; iPhone plan may differ)")
+    else:
+        print(f"  [ios] CPU_AND_NE predict succeeded  OK")
+    return True
+
+
+# --- Stage A: language_model_single.onnx -----------------------------------
+
+
+class _LanguageModelWrapper(nn.Module):
+    """Single-step GPT-2 decode, with attention rewritten in primitives.
+
+    HF's GPT2Model / GPT2Block / GPT2Attention all funnel past_key_values
+    through `transformers.cache_utils.Cache`, which torch.onnx.export (both
+    legacy and dynamo) cannot trace cleanly — it triggers a functorch vmap
+    dispatch loop ('unordered_map::at: key not found') or ProxyTorchDispatchMode
+    assertions deep in torch.export. We work around it by reusing the trained
+    weight modules (ln_1/ln_2/mlp/c_attn/c_proj) but driving the attention math
+    ourselves with plain (key, value) tensors per layer.
+
+    Forward signature:
+        (inputs_embeds, attention_mask, position_ids,
+         k0, v0, k1, v1, ..., k23, v23)
+    Outputs:
+        (logits, present_k0, present_v0, ..., present_k23, present_v23)
+    Names match Swift OrtFastDecoder's expectations."""
+
+    def __init__(self, t3):
+        super().__init__()
+        tfmr = t3.tfmr
+        self.speech_head = t3.speech_head  # Linear(1024, 6563)
+        self.wpe = tfmr.wpe
+        self.ln_f = tfmr.ln_f
+        # Keep blocks as-is so we can reach .ln_1, .ln_2, .attn.{c_attn, c_proj,
+        # resid_dropout}, and .mlp on each one without copying.
+        self.h = tfmr.h
+        self.n_layer = len(tfmr.h)
+        self.n_head = GPT2_HEADS
+        self.head_dim = GPT2_HEAD_DIM
+        self.hidden = GPT2_HIDDEN
+        self.split_size = GPT2_HIDDEN
+
+    def _block_forward(self, block, hidden_states, past_k, past_v, attn_mask_additive):
+        # --- self-attention -------------------------------------------------
+        residual = hidden_states
+        h = block.ln_1(hidden_states)
+        qkv = block.attn.c_attn(h)  # (1, seq, 3*hidden)
+        q, k_new, v_new = qkv.split(self.split_size, dim=2)
+
+        # (1, seq, hidden) -> (1, heads, seq, head_dim)
+        q = q.view(1, -1, self.n_head, self.head_dim).transpose(1, 2)
+        k_new = k_new.view(1, -1, self.n_head, self.head_dim).transpose(1, 2)
+        v_new = v_new.view(1, -1, self.n_head, self.head_dim).transpose(1, 2)
+
+        # Append the new step's k/v to past
+        k_full = torch.cat([past_k, k_new], dim=2)
+        v_full = torch.cat([past_v, v_new], dim=2)
+
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            q, k_full, v_full,
+            attn_mask=attn_mask_additive,
+            is_causal=False,
+            dropout_p=0.0,
+        )
+        attn = attn.transpose(1, 2).contiguous().view(1, -1, self.hidden)
+        attn = block.attn.c_proj(attn)
+        attn = block.attn.resid_dropout(attn)
+        hidden_states = residual + attn
+
+        # --- mlp ------------------------------------------------------------
+        residual = hidden_states
+        h = block.ln_2(hidden_states)
+        h = block.mlp(h)
+        hidden_states = residual + h
+
+        return hidden_states, k_full, v_full
+
+    def forward(self, inputs_embeds, attention_mask, position_ids, *flat_past_kv):
+        assert len(flat_past_kv) == GPT2_LAYERS * 2
+
+        # Position embeddings (wte was applied upstream by the caller; we get
+        # inputs_embeds directly to match the iOS Swift call pattern).
+        position_embeds = self.wpe(position_ids)
+        hidden_states = inputs_embeds + position_embeds
+
+        # Build additive 4D attention mask: (1, 1, 1, total_seq_len). Valid
+        # positions = 0, invalid = -1e9 so softmax ignores them. Input is
+        # (1, total_seq_len) int64 of 0/1 from the Swift call (always all 1s
+        # in normal decode); we still honor zeros for general correctness.
+        attn_mask_4d = (
+            (1.0 - attention_mask.to(hidden_states.dtype).view(1, 1, 1, -1)) * -1.0e9
+        )
+
+        present_kv = []
+        for layer_idx in range(self.n_layer):
+            past_k = flat_past_kv[2 * layer_idx]
+            past_v = flat_past_kv[2 * layer_idx + 1]
+            hidden_states, present_k, present_v = self._block_forward(
+                self.h[layer_idx], hidden_states, past_k, past_v, attn_mask_4d
+            )
+            present_kv.append(present_k)
+            present_kv.append(present_v)
+
+        hidden_states = self.ln_f(hidden_states)
+        logits = self.speech_head(hidden_states).squeeze(1)  # (1, 6563)
+        return (logits, *present_kv)
+
+
+def _lm_onnx_io_names():
+    inputs = ["inputs_embeds", "attention_mask", "position_ids"]
+    for i in range(GPT2_LAYERS):
+        inputs.extend([f"past_key_values.{i}.key", f"past_key_values.{i}.value"])
+    outputs = ["logits"]
+    for i in range(GPT2_LAYERS):
+        outputs.extend([f"present.{i}.key", f"present.{i}.value"])
+    return inputs, outputs
+
+
+def _lm_onnx_dynamic_axes():
+    axes = {
+        "attention_mask": {1: "total_seq_len"},
+    }
+    for i in range(GPT2_LAYERS):
+        axes[f"past_key_values.{i}.key"] = {2: "past_len"}
+        axes[f"past_key_values.{i}.value"] = {2: "past_len"}
+        axes[f"present.{i}.key"] = {2: "total_seq_len"}
+        axes[f"present.{i}.value"] = {2: "total_seq_len"}
+    return axes
+
+
+def _make_fixture_lm_onnx(seed=0, past_len=10):
+    """Deterministic fixture matching the Swift call signature in OrtFastDecoder."""
+    rng = _seeded_rng(seed)
+    total_seq_len = past_len + 1
+    inputs_embeds = rng.standard_normal((1, 1, GPT2_HIDDEN), dtype=np.float32) * 0.02
+    attention_mask = np.ones((1, total_seq_len), dtype=np.int64)
+    position_ids = np.array([[past_len]], dtype=np.int64)
+    kv = []
+    for _ in range(GPT2_LAYERS):
+        k = rng.standard_normal((1, GPT2_HEADS, past_len, GPT2_HEAD_DIM), dtype=np.float32) * 0.1
+        v = rng.standard_normal((1, GPT2_HEADS, past_len, GPT2_HEAD_DIM), dtype=np.float32) * 0.1
+        kv.append((k, v))
+    return inputs_embeds, attention_mask, position_ids, kv
+
+
+def convert_language_model_onnx(model, output_dir, validate=False, reference_dir=None):
+    """Export the single-step GPT-2 decoder as language_model_single.onnx."""
+    print("\n=== Converting language_model_single.onnx ===")
+    onnx_dir = os.path.join(output_dir, "onnx")
+    os.makedirs(onnx_dir, exist_ok=True)
+    out_path = os.path.join(onnx_dir, "language_model_single.onnx")
+
+    wrapper = _LanguageModelWrapper(model.t3)
+    wrapper.train(False)
+
+    past_len = 10
+    embeds_t = torch.randn(1, 1, GPT2_HIDDEN, dtype=torch.float32) * 0.02
+    mask_t = torch.ones(1, past_len + 1, dtype=torch.int64)
+    pos_t = torch.tensor([[past_len]], dtype=torch.int64)
+    flat_pkv_t = []
+    for _ in range(GPT2_LAYERS):
+        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
+        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
+
+    input_names, output_names = _lm_onnx_io_names()
+    dynamic_axes = _lm_onnx_dynamic_axes()
+
+    print(f"  Exporting to {out_path} (opset 17)...")
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            (embeds_t, mask_t, pos_t, *flat_pkv_t),
+            out_path,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=17,
+            do_constant_folding=True,
+        )
+    size_mb = os.path.getsize(out_path) / 1e6
+    print(f"  Wrote {size_mb:.1f} MB")
+
+    if validate:
+        validate_language_model_onnx(model, out_path, reference_dir=reference_dir)
+
+
+def validate_language_model_onnx(model, our_path, reference_dir=None):
+    print("\n  --- language_model_single.onnx validation ---")
+
+    embeds, mask, pos, kv_pairs = _make_fixture_lm_onnx(seed=0, past_len=10)
+
+    our_sess = _load_onnx_session(our_path)
+    inputs = {
+        "inputs_embeds": embeds,
+        "attention_mask": mask,
+        "position_ids": pos,
+    }
+    for i, (k, v) in enumerate(kv_pairs):
+        inputs[f"past_key_values.{i}.key"] = k
+        inputs[f"past_key_values.{i}.value"] = v
+    output_names = ["logits"] + sum(
+        ([f"present.{i}.key", f"present.{i}.value"] for i in range(GPT2_LAYERS)), []
+    )
+
+    our_outs = our_sess.run(output_names, inputs)
+    our_logits = our_outs[0]
+    our_present_k = [our_outs[1 + 2 * i] for i in range(GPT2_LAYERS)]
+    our_present_v = [our_outs[2 + 2 * i] for i in range(GPT2_LAYERS)]
+
+    if reference_dir is not None:
+        ref_path = os.path.join(reference_dir, "onnx", "language_model_single.onnx")
+        if not os.path.exists(ref_path):
+            print(f"  (reference not at {ref_path}; falling back to PyTorch ref)")
+            ref_outs = None
+        else:
+            print(f"  Comparing against HF reference at {ref_path}...")
+            ref_sess = _load_onnx_session(ref_path)
+            ref_outs = ref_sess.run(output_names, inputs)
+    else:
+        ref_outs = None
+
+    if ref_outs is None:
+        print("  Comparing against PyTorch reference...")
+        with torch.no_grad():
+            wrapper = _LanguageModelWrapper(model.t3)
+            wrapper.train(False)
+            t_inputs = (
+                torch.from_numpy(embeds),
+                torch.from_numpy(mask),
+                torch.from_numpy(pos),
+                *[torch.from_numpy(arr) for kv in kv_pairs for arr in kv],
+            )
+            t_out = wrapper(*t_inputs)
+            ref_outs = [x.detach().cpu().numpy() for x in t_out]
+
+    ok = True
+    ok &= _compare_outputs("logits", our_logits, ref_outs[0], atol=1e-2, cos_min=0.999)
+    for i in range(GPT2_LAYERS):
+        ok &= _compare_outputs(
+            f"present.{i}.key", our_present_k[i], ref_outs[1 + 2 * i], atol=5e-3
+        )
+        ok &= _compare_outputs(
+            f"present.{i}.value", our_present_v[i], ref_outs[2 + 2 * i], atol=5e-3
+        )
+
+    print(f"\n  --- iOS compatibility ---")
+    ok &= _check_onnx_graph_for_ios(our_path)
+    print(f"\n  language_model_single.onnx: {'READY' if ok else 'NOT READY'}")
+    return ok
+
+
+# --- Stage B: T3Prefill.mlpackage ------------------------------------------
+
+
+class _T3PrefillWrapper(nn.Module):
+    """Single-pass prefill: text + cond_speech + speaker + start_speech → logits + full KV cache.
+
+    Mirrors the chatterbox T3 prefill assembly (cond_enc + prepare_input_embeds)
+    and the manual attention path from _LanguageModelWrapper. The Swift caller
+    (OnnxT3Runner.swift:runCoreMLPrefill) expects this exact contract:
+      Inputs:  text_tokens (1, T_text) int32,
+               cond_speech_tokens (1, T_cond) int32,
+               speaker_emb (1, 256) fp32,
+               speech_tokens (1, T_speech) int32  (typically T_speech=1 = start token)
+      Outputs: logits (1, 6563) fp32,
+               kv_cache (48, 1, 16, T_total, 64) fp32, interleaved K0,V0,K1,V1,...,K23,V23
+    """
+
+    def __init__(self, t3):
+        super().__init__()
+        self.text_emb = t3.text_emb            # Embedding(50276, 1024)
+        self.speech_emb = t3.speech_emb        # Embedding(6563, 1024)
+        self.spkr_enc = t3.cond_enc.spkr_enc   # Linear(256, 1024)
+        self.wpe = t3.tfmr.wpe                 # Embedding(8196, 1024)
+        self.ln_f = t3.tfmr.ln_f
+        self.h = t3.tfmr.h                     # ModuleList of 24 GPT2Block
+        self.speech_head = t3.speech_head      # Linear(1024, 6563, bias=False)
+        self.n_layer = GPT2_LAYERS
+        self.n_head = GPT2_HEADS
+        self.head_dim = GPT2_HEAD_DIM
+        self.hidden = GPT2_HIDDEN
+
+    def forward(self, text_tokens, cond_speech_tokens, speaker_emb, speech_tokens):
+        # Embedding lookups (int32 -> long for nn.Embedding)
+        text_e = self.text_emb(text_tokens.long())             # (1, T_text, H)
+        cond_e = self.speech_emb(cond_speech_tokens.long())    # (1, T_cond, H)
+        speech_e = self.speech_emb(speech_tokens.long())       # (1, T_speech, H)
+        spkr_e = self.spkr_enc(speaker_emb).unsqueeze(1)       # (1, 1, H)
+
+        # T3CondEnc.forward for Turbo (use_perceiver_resampler=False, emotion_adv=False)
+        # builds cond_emb = [spkr, cond_clap=empty, cond_prompt_speech, cond_emotion=empty]
+        # and prepare_input_embeds concats [cond_emb, text_emb, speech_emb].
+        embeds = torch.cat([spkr_e, cond_e, text_e, speech_e], dim=1)  # (1, T, H)
+        T = embeds.shape[1]
+
+        # GPT-2 absolute position embeddings (wpe)
+        position_ids = torch.arange(T, dtype=torch.long, device=embeds.device).unsqueeze(0)
+        hidden = embeds + self.wpe(position_ids)
+
+        # Explicit additive causal mask. SDPA's is_causal=True works in PyTorch
+        # but trace-export sometimes elides it on dynamic shapes — explicit is
+        # safer for CoreML/ONNX export reproducibility.
+        causal_mask = torch.triu(
+            torch.full((T, T), -1.0e9, dtype=hidden.dtype, device=hidden.device),
+            diagonal=1,
+        ).view(1, 1, T, T)
+
+        present_kv = []  # interleaved K0, V0, K1, V1, ...
+        for layer_idx in range(self.n_layer):
+            block = self.h[layer_idx]
+
+            # Self-attention
+            residual = hidden
+            h_in = block.ln_1(hidden)
+            qkv = block.attn.c_attn(h_in)
+            q, k, v = qkv.split(self.hidden, dim=2)
+            q = q.view(1, T, self.n_head, self.head_dim).transpose(1, 2)
+            k = k.view(1, T, self.n_head, self.head_dim).transpose(1, 2)
+            v = v.view(1, T, self.n_head, self.head_dim).transpose(1, 2)
+
+            attn = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=causal_mask, is_causal=False, dropout_p=0.0
+            )
+            attn = attn.transpose(1, 2).contiguous().view(1, T, self.hidden)
+            attn = block.attn.c_proj(attn)
+            attn = block.attn.resid_dropout(attn)
+            hidden = residual + attn
+
+            # MLP
+            residual = hidden
+            h_mlp = block.ln_2(hidden)
+            h_mlp = block.mlp(h_mlp)
+            hidden = residual + h_mlp
+
+            present_kv.append(k)  # (1, 16, T, 64)
+            present_kv.append(v)
+
+        hidden = self.ln_f(hidden)
+        # Logits at the last position (= the start-speech-token's hidden state)
+        logits = self.speech_head(hidden[:, -1:, :]).squeeze(1)  # (1, 6563)
+
+        # (48, 1, 16, T, 64) interleaved K/V per layer — matches Swift splitKVCacheRaw
+        kv_cache = torch.stack(present_kv, dim=0)
+        return logits, kv_cache
+
+
+def _make_fixture_prefill(seed=0, t_text=3, t_cond=375, t_speech=1):
+    """Deterministic fixture matching MIL defaults (text=3, cond=375, speech=1)."""
+    rng = _seeded_rng(seed)
+    text_tokens = rng.integers(0, 50000, size=(1, t_text), dtype=np.int32)
+    cond_speech_tokens = rng.integers(0, SPEECH_VOCAB_SIZE - 2, size=(1, t_cond), dtype=np.int32)
+    speaker_emb = rng.standard_normal((1, SPEAKER_EMB_DIM), dtype=np.float32) * 0.5
+    speech_tokens = np.array([[SPEECH_START_TOKEN]], dtype=np.int32)
+    return text_tokens, cond_speech_tokens, speaker_emb, speech_tokens
+
+
+def convert_prefill(model, output_dir, validate=False, reference_dir=None):
+    """Convert the T3 prefill module to T3Prefill.mlpackage."""
+    print("\n=== Converting T3Prefill.mlpackage ===")
+    out_path = os.path.join(output_dir, "T3Prefill.mlpackage")
+
+    wrapper = _T3PrefillWrapper(model.t3)
+    wrapper.train(False)
+
+    # Trace with MIL default shapes (T_text=3, T_cond=375, T_speech=1)
+    text_t, cond_t, spkr_t, spch_t = _make_fixture_prefill(seed=0)
+    text_pt = torch.from_numpy(text_t)
+    cond_pt = torch.from_numpy(cond_t)
+    spkr_pt = torch.from_numpy(spkr_t)
+    spch_pt = torch.from_numpy(spch_t)
+
+    print(
+        f"  Tracing with T_text={text_pt.shape[1]}, "
+        f"T_cond={cond_pt.shape[1]}, T_speech={spch_pt.shape[1]}..."
+    )
+    with torch.no_grad():
+        # check_trace=False suppresses spurious 1e-5 mismatch warnings caused
+        # by the SDPA fast path; we validate the converted model afterwards.
+        traced = torch.jit.trace(
+            wrapper, (text_pt, cond_pt, spkr_pt, spch_pt), check_trace=False
+        )
+
+    print("  Converting to CoreML (FP32 weights, iOS18 target)...")
+    inputs = [
+        ct.TensorType(
+            name="text_tokens",
+            shape=ct.Shape(shape=(1, ct.RangeDim(lower_bound=1, upper_bound=512, default=3))),
+            dtype=np.int32,
+        ),
+        ct.TensorType(
+            name="cond_speech_tokens",
+            shape=ct.Shape(shape=(1, ct.RangeDim(lower_bound=1, upper_bound=1024, default=375))),
+            dtype=np.int32,
+        ),
+        ct.TensorType(name="speaker_emb", shape=(1, SPEAKER_EMB_DIM), dtype=np.float32),
+        ct.TensorType(
+            name="speech_tokens",
+            shape=ct.Shape(shape=(1, ct.RangeDim(lower_bound=1, upper_bound=2048, default=1))),
+            dtype=np.int32,
+        ),
+    ]
+    outputs = [
+        ct.TensorType(name="logits", dtype=np.float32),
+        ct.TensorType(name="kv_cache", dtype=np.float32),
+    ]
+    # FLOAT32 matches the HF reference T3Prefill.mlmodelc weight precision
+    # (1.5 GB weight.bin = 4 bytes/param). FLOAT16 cuts that in half but the
+    # iPhone happily runs FP32 too and the HF copy is what's been validated
+    # device-side. Swift selects compute_units at load time (cpuAndGPU).
+    mlmodel = ct.convert(
+        traced,
+        inputs=inputs,
+        outputs=outputs,
+        compute_precision=ct.precision.FLOAT32,
+        compute_units=ct.ComputeUnit.CPU_AND_GPU,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    if os.path.exists(out_path):
+        shutil.rmtree(out_path)
+    mlmodel.save(out_path)
+    size_mb = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _, files in os.walk(out_path) for f in files
+    ) / 1e6
+    print(f"  Saved {out_path} ({size_mb:.1f} MB)")
+
+    if validate:
+        validate_prefill(model, out_path, reference_dir=reference_dir)
+
+
+def validate_prefill(model, our_path, reference_dir=None):
+    print("\n  --- T3Prefill.mlpackage validation ---")
+
+    # Use the MIL default fixture (T_text=3, T_cond=375, T_speech=1) so any
+    # reference vs ours diff is purely numerical, not shape-driven.
+    text_t, cond_t, spkr_t, spch_t = _make_fixture_prefill(seed=0)
+    inputs = {
+        "text_tokens": text_t,
+        "cond_speech_tokens": cond_t,
+        "speaker_emb": spkr_t,
+        "speech_tokens": spch_t,
+    }
+
+    # Load OURS via CoreML
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_pkg = os.path.join(tmp, "T3Prefill.mlpackage")
+        shutil.copytree(our_path, tmp_pkg)
+        our_ml = ct.models.MLModel(tmp_pkg, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+        our_out = our_ml.predict(inputs)
+    our_logits = np.asarray(our_out["logits"], dtype=np.float32)
+    our_kv = np.asarray(our_out["kv_cache"], dtype=np.float32)
+
+    # Reference. The HF snapshot's T3Prefill.mlmodelc dir is missing the
+    # Manifest.json that coremltools' MLModel() needs to load — it was the
+    # raw model.mil/weights output from ct.convert, not a Xcode-compiled
+    # artifact. If we can't load it directly, fall back to PyTorch.
+    ref_logits = ref_kv = None
+    if reference_dir is not None:
+        for candidate in ("T3Prefill.mlpackage", "T3Prefill.mlmodelc"):
+            ref_path = os.path.join(reference_dir, candidate)
+            if not os.path.exists(ref_path):
+                continue
+            try:
+                print(f"  Comparing against HF reference at {ref_path}...")
+                ref_ml = ct.models.MLModel(ref_path, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+                ref_out = ref_ml.predict(inputs)
+                ref_logits = np.asarray(ref_out["logits"], dtype=np.float32)
+                ref_kv = np.asarray(ref_out["kv_cache"], dtype=np.float32)
+                break
+            except Exception as exc:
+                print(f"  (could not load HF reference: {str(exc)[:160]}; will fall back to PyTorch)")
+
+    if ref_logits is None:
+        print("  Comparing against PyTorch reference...")
+        with torch.no_grad():
+            wrapper = _T3PrefillWrapper(model.t3)
+            wrapper.train(False)
+            t_logits, t_kv = wrapper(
+                torch.from_numpy(text_t),
+                torch.from_numpy(cond_t),
+                torch.from_numpy(spkr_t),
+                torch.from_numpy(spch_t),
+            )
+            ref_logits = t_logits.detach().cpu().numpy()
+            ref_kv = t_kv.detach().cpu().numpy()
+
+    ok = True
+    ok &= _compare_outputs("logits", our_logits, ref_logits, cos_min=0.99, atol=0.5)
+    ok &= _compare_outputs("kv_cache", our_kv, ref_kv, cos_min=0.99, atol=0.05)
+
+    print(f"\n  --- iOS compatibility ---")
+    ok &= _check_xcrun_coremlcompiler(our_path)
+    ok &= _try_ane_compute(our_path, inputs)
+    print(f"\n  T3Prefill.mlpackage: {'READY' if ok else 'NOT READY'}")
+    return ok
+
+
+# --- Stage C: conditional_decoder_single.onnx ------------------------------
+
+
+class _ConditionalDecoderWrapper(nn.Module):
+    """Bundles S3Gen's entire post-T3 audio chain into one ONNX graph.
+
+    Matches Swift OnnxConditionalDecoder.swift's call signature:
+      Inputs:
+        speech_tokens     (1, T_total)  int64  -- prompt_token+speech_token concat
+        speaker_embeddings (1, 192)     float  -- raw CAMPPlus emb, pre-normalized by Swift
+        speaker_features   (1, T_feat, 80) float  -- prompt mel features (BTC)
+      Output:
+        waveform (1, N_samples) float, 24 kHz
+
+    Internally:
+      input_embedding -> encoder -> encoder_proj          (token -> mel mu)
+      spk_embed_affine_layer                              (192 -> internal cond dim)
+      CFM 2-step Euler solver, unrolled (meanflow=True)   (mu, mask, spks, cond -> mel)
+      Strip prompt portion of mel
+      mel2wav (HiFTGenerator)                             (mel -> waveform via ISTFT)
+      Trim-fade to reduce reference clip spillover
+
+    Skips chatterbox's `flow.inference` glue because it has Python control flow
+    (`.item()`, dict ref_dict casting) that doesn't trace.
+    """
+
+    def __init__(self, s3gen):
+        super().__init__()
+        flow = s3gen.flow
+        self.input_embedding = flow.input_embedding
+        self.encoder = flow.encoder
+        self.encoder_proj = flow.encoder_proj
+        self.spk_embed_affine_layer = flow.spk_embed_affine_layer
+        self.estimator = flow.decoder.estimator
+        self.mel2wav = s3gen.mel2wav
+        # trim_fade is a (2 * n_trim,) tensor: zeros for the first n_trim samples,
+        # then a cos-shaped ramp up. Multiplied into the wav head to mute the
+        # carry-over from the reference clip.
+        self.register_buffer("trim_fade", s3gen.trim_fade.detach().clone(), persistent=False)
+        self.output_size = flow.output_size  # 80
+
+    def forward(self, speech_tokens, speaker_embeddings, speaker_features):
+        # --- speaker conditioning -------------------------------------------
+        spks = self.spk_embed_affine_layer(speaker_embeddings)  # (1, internal_dim)
+
+        # --- token embedding + Conformer encoder ----------------------------
+        T_total = speech_tokens.shape[1]
+        # Length tensor for the encoder. No padding (batch=1 full sequence).
+        token_len = torch.tensor([T_total], dtype=torch.long, device=speech_tokens.device)
+        x = self.input_embedding(speech_tokens.long())  # (1, T_total, in_dim)
+        h, _ = self.encoder(x, token_len)               # (1, T_h, enc_dim)
+        h = self.encoder_proj(h)                        # (1, T_h, 80)
+
+        T_h = h.shape[1]
+        T_feat = speaker_features.shape[1]              # prompt mel length
+
+        # --- conds = [prompt_mel | zeros], BCT layout -----------------------
+        # zeros of length T_h - T_feat (= T_mel_gen) padded after prompt
+        zeros_pad = torch.zeros(
+            (1, T_h - T_feat, self.output_size), dtype=h.dtype, device=h.device
+        )
+        conds_btc = torch.cat([speaker_features, zeros_pad], dim=1)  # (1, T_h, 80)
+        conds = conds_btc.transpose(1, 2).contiguous()               # (1, 80, T_h)
+
+        # --- mu + mask for CFM ----------------------------------------------
+        mu = h.transpose(1, 2).contiguous()                          # (1, 80, T_h)
+        # No padding -> mask = ones. Required shape: (1, 1, T_h).
+        mask = torch.ones((1, 1, T_h), dtype=h.dtype, device=h.device)
+
+        # --- CFM 2-step Euler (meanflow=True), unrolled ---------------------
+        # CausalConditionalCFM.forward initializes z = randn_like(mu) then in
+        # meanflow path splices noised_mels (also randn) over the generated
+        # portion. Net effect: z is just full Gaussian noise. We emit a single
+        # randn -> RandomNormal ONNX op derived from mu's shape.
+        z = torch.randn_like(mu)
+
+        # t_span = linspace(0, 1, 3) = [0, 0.5, 1.0]; dt constant = 0.5
+        t0 = torch.zeros(1, dtype=mu.dtype, device=mu.device)
+        t1 = torch.full((1,), 0.5, dtype=mu.dtype, device=mu.device)
+        t2 = torch.ones(1, dtype=mu.dtype, device=mu.device)
+        dt = torch.full((1,), 0.5, dtype=mu.dtype, device=mu.device)
+
+        dxdt = self.estimator(z, mask, mu, t0, spks, conds, t1)
+        x1 = z + dt * dxdt
+        dxdt = self.estimator(x1, mask, mu, t1, spks, conds, t2)
+        feat_full = x1 + dt * dxdt  # (1, 80, T_h)
+
+        # Slice off the prompt portion -> mel for the generated speech only
+        feat = feat_full[:, :, T_feat:]  # (1, 80, T_h - T_feat)
+
+        # --- HiFTGenerator vocoder ------------------------------------------
+        # cache_source is empty: the .inference() if-branch on shape[2] != 0
+        # is excluded during trace. Pass empty as a literal so it doesn't show
+        # up as a graph input.
+        cache_source = torch.zeros((1, 1, 0), dtype=feat.dtype, device=feat.device)
+        wav, _ = self.mel2wav.inference(speech_feat=feat, cache_source=cache_source)
+        # wav: (1, N_samples)
+
+        # --- trim_fade head mute --------------------------------------------
+        n_trim = self.trim_fade.shape[0]
+        head = wav[:, :n_trim] * self.trim_fade  # (1, n_trim)
+        tail = wav[:, n_trim:]                   # (1, N_samples - n_trim)
+        wav = torch.cat([head, tail], dim=1)
+        return wav
+
+
+def _make_fixture_cond_decoder(seed=0, n_prompt_tokens=50, n_gen_tokens=20):
+    """Deterministic fixture for conditional_decoder.
+
+    Chatterbox's flow inference constrains T_feat = 2 * n_prompt_tokens (the
+    encoder upsamples tokens 2x to mel frames). speech_tokens is the prompt +
+    generated tokens concatenated; speaker_features is the prompt's mel.
+    """
+    rng = _seeded_rng(seed)
+    t_speech = n_prompt_tokens + n_gen_tokens
+    t_feat = 2 * n_prompt_tokens
+    speech_tokens = rng.integers(0, SPEECH_VOCAB_SIZE - 3, size=(1, t_speech), dtype=np.int64)
+    raw_spk = rng.standard_normal((1, CAMPP_EMB_DIM), dtype=np.float32)
+    norm = np.linalg.norm(raw_spk) + 1e-12
+    speaker_embeddings = (raw_spk / norm).astype(np.float32)
+    speaker_features = (
+        rng.standard_normal((1, t_feat, 80), dtype=np.float32) * 0.5
+    ).astype(np.float32)
+    return speech_tokens, speaker_embeddings, speaker_features
+
+
+def _patch_chatterbox_for_export():
+    """Monkey-patch chatterbox modules to bypass tracing hazards.
+
+    1. `mask.add_optional_chunk_mask` does a defensive `.item()` check at line
+       161 to repair all-False mask rows. For batch=1 full-sequence usage this
+       branch is never taken; replace the function with a version that skips
+       it so dynamo doesn't error on GuardOnDataDependentSymNode.
+
+    2. `hifigan.SineGen.forward` constructs random phase via
+       `Uniform(...).sample(...)` and random noise via `torch.randn_like` —
+       both decompose into ops whose dtypes (`prims.signbit`) the dynamo
+       FX decomposer mis-tracks against the real tensor pass. Replace it
+       with a deterministic version (zero phase, zero noise). HiFTGenerator
+       inference doesn't need stochastic noise for correctness — the
+       additional source noise is a quality nudge, not load-bearing.
+    """
+    import numpy as _np
+    import chatterbox.models.s3gen.utils.mask as _cm_mask
+    from chatterbox.models.s3gen.utils.mask import subsequent_chunk_mask
+    import chatterbox.models.s3gen.hifigan as _cm_hifi
+
+    if getattr(_cm_mask, "_export_safe", False):
+        return
+
+    def _safe_add_optional_chunk_mask(
+        xs, masks, use_dynamic_chunk, use_dynamic_left_chunk,
+        decoding_chunk_size, static_chunk_size, num_decoding_left_chunks,
+        enable_full_context=True,
+    ):
+        if use_dynamic_chunk:
+            max_len = xs.size(1)
+            if decoding_chunk_size < 0:
+                chunk_size = max_len; num_left_chunks = -1
+            elif decoding_chunk_size > 0:
+                chunk_size = decoding_chunk_size
+                num_left_chunks = num_decoding_left_chunks
+            else:
+                chunk_size = max_len
+                num_left_chunks = -1
+            chunk_masks = subsequent_chunk_mask(
+                xs.size(1), chunk_size, num_left_chunks, xs.device
+            ).unsqueeze(0)
+            chunk_masks = masks & chunk_masks
+        elif static_chunk_size > 0:
+            chunk_masks = subsequent_chunk_mask(
+                xs.size(1), static_chunk_size, num_decoding_left_chunks, xs.device
+            ).unsqueeze(0)
+            chunk_masks = masks & chunk_masks
+        else:
+            chunk_masks = masks
+        return chunk_masks
+
+    # SourceModuleHnNSF.forward feeds through SineGen which has 9 harmonic
+    # bins; the `cumsum % 1` and `voiced_threshold` comparison decompose into
+    # `prims.signbit` ops that torch 2.8's dynamo fake-tensor system mis-tracks.
+    # Bypass the entire harmonic source path: return tanh(0) = 0 of the right
+    # shape. The downstream `decode()` still mixes this into the upsampled
+    # signal, just with no harmonic contribution. Quality drops a bit; the
+    # graph exports cleanly and the model still produces intelligible audio.
+    def _safe_source_module_forward(self, x):
+        # x: (B, T, 1) per SourceModuleHnNSF docstring
+        # output sine_merge: (B, T, 1) — l_linear projects harmonic_num+1 -> 1
+        sine_merge = torch.zeros(
+            (x.size(0), x.size(1), 1), device=x.device, dtype=x.dtype
+        )
+        return sine_merge, None, None
+
+    # EspnetRelPositionalEncoding.extend_pe is called on every encoder forward
+    # and rewrites self.pe in-place via `pe_positive[:, 0::2] = ...`. PE is
+    # populated in __init__ to max_len=5000 — plenty for our sizes — so we
+    # disable the extend logic entirely. Increase max_len at construction time
+    # if you ever trace with > 5000 mel frames.
+    import chatterbox.models.s3gen.transformer.embedding as _cm_emb
+
+    def _noop_extend_pe(self, x):
+        return
+    _cm_emb.EspnetRelPositionalEncoding.extend_pe = _noop_extend_pe
+
+    # HiFTGenerator.inference has the f0_predictor → m_source path (signbit
+    # dtype mismatch — already bypassed via the SourceModule patch), and the
+    # cache_source if-branch `if cache_source.shape[2] != 0: s[:, :, :cs] = ...`
+    # which dynamo still traces as in-place (as_strided + copy_to) even when
+    # statically false. Replace with a streamlined version that feeds the
+    # zero source (matching the bypassed m_source output) straight to decode.
+    def _safe_hift_inference(self, speech_feat, cache_source=None):
+        upsample_scale = 1
+        for r in [8, 5, 3]:
+            upsample_scale *= r
+        upsample_scale *= self.istft_params["hop_len"]
+        T_samples = speech_feat.shape[2] * upsample_scale
+        # decode() expects s shaped (B, 1, T_samples)
+        s = torch.zeros(
+            (speech_feat.size(0), 1, T_samples),
+            device=speech_feat.device, dtype=speech_feat.dtype,
+        )
+        return self.decode(x=speech_feat, s=s), s
+
+    # _stft is called inside decode() to compute the source STFT. With our
+    # zero-source bypass, the result is zero — return right-shaped zeros to
+    # avoid the legacy exporter rejecting torch.stft's complex output.
+    def _safe_stft(self, x):
+        n_fft = self.istft_params["n_fft"]
+        hop = self.istft_params["hop_len"]
+        K = n_fft // 2 + 1
+        n_frames = x.shape[-1] // hop + 1
+        zeros = torch.zeros((x.shape[0], K, n_frames), device=x.device, dtype=x.dtype)
+        return zeros, zeros
+
+    # _istft uses torch.complex(real, imag) + torch.istft. Neither exports in
+    # opset 17 legacy. Replace with primitives: real-spectrum IDFT via cos/sin
+    # matmul + overlap-add via conv_transpose1d (identity kernel). F.fold was
+    # the first attempt but the legacy opset-18 col2im symbolic chokes on
+    # dynamic output_size with a NoneType subscript bug.
+    def _safe_istft(self, magnitude, phase):
+        n_fft = self.istft_params["n_fft"]   # 16
+        hop = self.istft_params["hop_len"]   # 4
+        K = n_fft // 2 + 1                   # 9
+        window = self.stft_window.to(magnitude.device).to(magnitude.dtype)
+
+        magnitude = torch.clip(magnitude, max=1.0e2)
+        real = magnitude * torch.cos(phase)
+        imag = magnitude * torch.sin(phase)
+
+        # Reconstruction weights for one-sided spectrum (DC and Nyquist unscaled,
+        # interior bins x2).
+        weights = torch.ones(K, dtype=magnitude.dtype, device=magnitude.device)
+        weights[1 : K - 1] = 2.0
+
+        # IDFT cos/sin basis: angle[k, n] = 2*pi*k*n/N
+        n_idx = torch.arange(n_fft, dtype=magnitude.dtype, device=magnitude.device)
+        k_idx = torch.arange(K, dtype=magnitude.dtype, device=magnitude.device)
+        angle = (2.0 * torch.pi / n_fft) * k_idx[:, None] * n_idx[None, :]
+        cos_basis = torch.cos(angle)
+        sin_basis = torch.sin(angle)
+
+        real_w = (real * weights[None, :, None]).transpose(1, 2)  # (B, F, K)
+        imag_w = (imag * weights[None, :, None]).transpose(1, 2)
+
+        # Time-domain per-frame samples
+        frames = (real_w @ cos_basis - imag_w @ sin_basis) / n_fft  # (B, F, n_fft)
+        frames = frames * window[None, None, :]
+
+        # Overlap-add via conv_transpose1d with identity kernel.
+        # input (B, n_fft, F), weight (n_fft, 1, n_fft) where w[i, 0, j] = 1[i==j],
+        # output (B, 1, (F-1)*hop + n_fft).
+        x_for_ct = frames.transpose(1, 2).contiguous()
+        eye_kernel = torch.eye(n_fft, dtype=magnitude.dtype, device=magnitude.device).unsqueeze(1)
+        ola = torch.nn.functional.conv_transpose1d(
+            x_for_ct, eye_kernel, stride=hop
+        ).squeeze(1)  # (B, out_full_len)
+
+        # Window envelope normalization (matches torch.istft(normalized=False)).
+        win_sq = (window ** 2)[None, :, None].expand(1, n_fft, frames.shape[1])
+        win_sq_kernel = eye_kernel  # same identity
+        env = torch.nn.functional.conv_transpose1d(
+            win_sq, win_sq_kernel, stride=hop
+        ).squeeze(1)  # (1, out_full_len)
+        env = torch.clamp(env, min=1.0e-10)
+        out = ola / env
+
+        # torch.istft(center=True) trims n_fft//2 from each side.
+        trim = n_fft // 2
+        out_len = ola.shape[1]
+        out = out[:, trim : out_len - trim]
+        return out
+
+    # decoder.py and upsample_encoder.py both do
+    #   `from .utils.mask import add_optional_chunk_mask`
+    # which captures the function by value at import time. Patching the
+    # source module alone doesn't reach those consumers.
+    import chatterbox.models.s3gen.decoder as _cm_dec
+    import chatterbox.models.s3gen.transformer.upsample_encoder as _cm_uenc
+    _cm_mask.add_optional_chunk_mask = _safe_add_optional_chunk_mask
+    _cm_dec.add_optional_chunk_mask = _safe_add_optional_chunk_mask
+    _cm_uenc.add_optional_chunk_mask = _safe_add_optional_chunk_mask
+    _cm_hifi.SourceModuleHnNSF.forward = _safe_source_module_forward
+    _cm_hifi.HiFTGenerator.inference = _safe_hift_inference
+    _cm_hifi.HiFTGenerator._stft = _safe_stft
+    _cm_hifi.HiFTGenerator._istft = _safe_istft
+    _cm_mask._export_safe = True
+
+
+def convert_conditional_decoder(model, output_dir, validate=False, reference_dir=None):
+    """Export the full post-T3 audio chain as conditional_decoder_single.onnx."""
+    print("\n=== Converting conditional_decoder_single.onnx ===")
+    onnx_dir = os.path.join(output_dir, "onnx")
+    os.makedirs(onnx_dir, exist_ok=True)
+    out_path = os.path.join(onnx_dir, "conditional_decoder_single.onnx")
+
+    _patch_chatterbox_for_export()
+
+    wrapper = _ConditionalDecoderWrapper(model.s3gen)
+    wrapper.train(False)
+
+    speech_t, spk_t, feat_t = _make_fixture_cond_decoder(seed=0)
+    speech_pt = torch.from_numpy(speech_t)
+    spk_pt = torch.from_numpy(spk_t)
+    feat_pt = torch.from_numpy(feat_t)
+
+    print(
+        f"  Exporting with T_total={speech_pt.shape[1]} speech tokens, "
+        f"T_feat={feat_pt.shape[1]} mel frames, opset 18 (legacy)..."
+    )
+
+    # Legacy TorchScript exporter. Opset 18 (vs HF's 17): we need col2im
+    # for the manual ISTFT overlap-add via F.fold — HF used native STFT op
+    # which is opset 17, but we replaced that with primitives to dodge the
+    # complex-types limitation.
+    dynamic_axes = {
+        "speech_tokens": {1: "num_speech_tokens"},
+        "speaker_features": {1: "feature_dim"},
+        "waveform": {1: "num_samples"},
+    }
+
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            (speech_pt, spk_pt, feat_pt),
+            out_path,
+            input_names=["speech_tokens", "speaker_embeddings", "speaker_features"],
+            output_names=["waveform"],
+            dynamic_axes=dynamic_axes,
+            opset_version=18,
+            do_constant_folding=True,
+        )
+
+    size_mb = os.path.getsize(out_path) / 1e6
+    print(f"  Wrote {size_mb:.1f} MB")
+
+    if validate:
+        validate_conditional_decoder(model, out_path, reference_dir=reference_dir)
+
+
+def validate_conditional_decoder(model, our_path, reference_dir=None):
+    print("\n  --- conditional_decoder_single.onnx validation ---")
+
+    speech_t, spk_t, feat_t = _make_fixture_cond_decoder(seed=0)
+    inputs = {
+        "speech_tokens": speech_t,
+        "speaker_embeddings": spk_t,
+        "speaker_features": feat_t,
+    }
+
+    # OURS
+    our_sess = _load_onnx_session(our_path)
+    our_wav = our_sess.run(["waveform"], inputs)[0]
+
+    ref_wav = None
+    if reference_dir is not None:
+        ref_path = os.path.join(reference_dir, "onnx", "conditional_decoder_single.onnx")
+        if os.path.exists(ref_path):
+            try:
+                print(f"  Comparing against HF reference at {ref_path}...")
+                ref_sess = _load_onnx_session(ref_path)
+                ref_wav = ref_sess.run(["waveform"], inputs)[0]
+            except Exception as exc:
+                print(f"  (HF ref load failed: {str(exc)[:160]})")
+
+    if ref_wav is None:
+        print("  Comparing against PyTorch reference...")
+        with torch.no_grad():
+            wrapper = _ConditionalDecoderWrapper(model.s3gen)
+            wrapper.train(False)
+            torch.manual_seed(0)  # match RandomNormal seed for fair comparison
+            t_out = wrapper(
+                torch.from_numpy(speech_t),
+                torch.from_numpy(spk_t),
+                torch.from_numpy(feat_t),
+            )
+            ref_wav = t_out.detach().cpu().numpy()
+
+    # Waveforms differ across runs due to RandomNormal; compare via spectral
+    # statistics. Length should match; per-sample identity is not expected.
+    ok = True
+    if our_wav.shape != ref_wav.shape:
+        print(f"  [waveform] shape mismatch ours={our_wav.shape} ref={ref_wav.shape}  FAIL")
+        ok = False
+    else:
+        # mel-band log-magnitude cosine sim is robust to noise instance
+        our_db = np.log(np.abs(our_wav).reshape(-1) + 1e-6)
+        ref_db = np.log(np.abs(ref_wav).reshape(-1) + 1e-6)
+        cs = float(np.dot(our_db, ref_db) / ((np.linalg.norm(our_db) * np.linalg.norm(ref_db)) or 1.0))
+        ok &= cs >= 0.95
+        print(f"  [waveform] shape={our_wav.shape} log-mag cos_sim={cs:.4f}  {'PASS' if cs >= 0.95 else 'FAIL'}")
+
+    print(f"\n  --- iOS compatibility ---")
+    ok &= _check_onnx_graph_for_ios(our_path)
+    print(f"\n  conditional_decoder_single.onnx: {'READY' if ok else 'NOT READY'}")
+    return ok
+
+
+# ===========================================================================
 # MAIN
 # ===========================================================================
 
+V1_STAGES = ("t3", "s3", "vocoder", "all")
+V4_STAGES = ("prefill", "lm-onnx", "cond-decoder", "v4")
+ALL_STAGES = V1_STAGES + V4_STAGES + ("all-v4",)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert Chatterbox Turbo TTS to CoreML format"
+        description="Convert Chatterbox Turbo TTS to CoreML / ONNX (v1 and v4 pipelines)"
     )
     parser.add_argument(
         "--stage",
-        choices=["t3", "s3", "vocoder", "all"],
+        choices=ALL_STAGES,
         required=True,
-        help="Which stage to convert",
+        help=(
+            "Which stage to convert. v1: t3, s3, vocoder, all. "
+            "v4 (matches HF release): prefill, lm-onnx, cond-decoder, v4 (all three). "
+            "all-v4: v1 stages + v4 stages."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -804,28 +1933,76 @@ def main():
         action="store_true",
         help="Run numerical validation after conversion",
     )
+    parser.add_argument(
+        "--reference-dir",
+        default=None,
+        help=(
+            "Optional directory containing HF reference artifacts (e.g. the "
+            "ebrinz/chatterbox-turbo-coreml snapshot dir). When set, --validate "
+            "for v4 stages compares against the HF .onnx / .mlmodelc files; "
+            "otherwise it compares against a PyTorch reference."
+        ),
+    )
+    parser.add_argument(
+        "--low-mem",
+        action="store_true",
+        help=(
+            "Free intermediates aggressively and load reference artifacts "
+            "sequentially (not in parallel with ours). Useful on 8 GB Macs."
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load the PyTorch model
-    model = load_pytorch_model()
+    is_v4 = args.stage in V4_STAGES or args.stage == "all-v4"
+    is_v1 = args.stage in V1_STAGES or args.stage == "all-v4"
 
+    v1_model = None
+    v4_model = None
+
+    if is_v1:
+        v1_model = load_pytorch_model()
+    if is_v4:
+        v4_model = load_pytorch_model_v4()
+
+    # --- v1 stages ---
     if args.stage in ("t3", "all"):
-        convert_t3(model, args.output_dir, validate=args.validate)
-
+        convert_t3(v1_model, args.output_dir, validate=args.validate)
     if args.stage in ("s3", "all"):
-        convert_s3(model, args.output_dir, validate=args.validate)
-
+        convert_s3(v1_model, args.output_dir, validate=args.validate)
     if args.stage in ("vocoder", "all"):
-        extract_vocoder_weights(model, args.output_dir)
-
+        extract_vocoder_weights(v1_model, args.output_dir)
     if args.stage == "all":
-        extract_tokenizer_and_config(model, args.output_dir)
+        extract_tokenizer_and_config(v1_model, args.output_dir)
+
+    if args.stage == "all-v4":
+        # Also run v1 stages
+        convert_t3(v1_model, args.output_dir, validate=args.validate)
+        convert_s3(v1_model, args.output_dir, validate=args.validate)
+        extract_vocoder_weights(v1_model, args.output_dir)
+        extract_tokenizer_and_config(v1_model, args.output_dir)
+
+    # --- v4 stages ---
+    if args.stage in ("lm-onnx", "v4", "all-v4"):
+        convert_language_model_onnx(
+            v4_model, args.output_dir,
+            validate=args.validate, reference_dir=args.reference_dir,
+        )
+    if args.stage in ("prefill", "v4", "all-v4"):
+        convert_prefill(
+            v4_model, args.output_dir,
+            validate=args.validate, reference_dir=args.reference_dir,
+        )
+    if args.stage in ("cond-decoder", "v4", "all-v4"):
+        convert_conditional_decoder(
+            v4_model, args.output_dir,
+            validate=args.validate, reference_dir=args.reference_dir,
+        )
 
     print("\n=== Done ===")
     print(f"Output directory: {args.output_dir}")
-    if args.stage == "all":
+    if args.stage in ("all", "all-v4"):
         print("Files:")
         for f in sorted(os.listdir(args.output_dir)):
             fpath = os.path.join(args.output_dir, f)

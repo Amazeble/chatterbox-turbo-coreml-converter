@@ -1,11 +1,21 @@
-torch>=2.4
-coremltools>=8.0
+# Pinned to match the v4 reference artifacts on
+# huggingface.co/ebrinz/chatterbox-turbo-coreml (built with coremltools 9.0
+# and torch 2.7.1).
+torch>=2.7,<2.9
+coremltools>=9.0,<10.0
 numpy>=1.24
 safetensors>=0.4
 huggingface_hub>=0.24
-transformers>=4.44
+transformers>=4.55,<5.0
 pyyaml>=6.0
-# ResembleAI's chatterbox package (provides T3 / S3Gen / vocoder PyTorch modules)
-# Install from source — not on PyPI under this name at time of writing:
-#   pip install git+https://github.com/resemble-ai/chatterbox.git
-chatterbox @ git+https://github.com/resemble-ai/chatterbox.git
+onnx>=1.17
+onnxruntime>=1.18
+# onnxscript is required by torch.onnx.export(..., dynamo=True), which is
+# what we use for the v4 LM and conditional_decoder ONNX exports — the
+# legacy TorchScript-based exporter chokes on HF DynamicCache.
+onnxscript>=0.7
+# 0.1.7 is the most recent chatterbox-tts release that loads ChatterboxTurboTTS
+# cleanly with the GPT-2 backbone these weights require. The git head currently
+# regresses against this (broken imports + missing GPT2_medium key); do not
+# unpin without testing both T3 prefill and S3Gen forward.
+chatterbox-tts==0.1.7
