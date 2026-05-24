@@ -49,6 +49,28 @@ Two pipelines are supported:
 | `S3UNet.mlpackage` | Flow-matching U-Net denoiser (estimator + speaker-affine projection baked in). | ANE-eligible |
 | `hift_vocoder.safetensors` | HiFTGenerator vocoder weights (PyTorch — not converted to CoreML). | — |
 
+## Size & speed flags
+
+Three orthogonal flags trade size / speed against quality. Stack them as
+needed; each one's effect is documented in the validator output.
+
+| Flag | What it does | Applies to | Typical size / speed change | Quality impact |
+|---|---|---|---|---|
+| `--cfm-steps 1` | Halves the CFM solver from 2 unrolled Euler steps to 1 | `cond-decoder` | ~halved cond_decoder runtime; ~same file size | Modest log-mag cos sim drop (~0.886 → ~0.874 in our test) |
+| `--optimize-graph` | Runs `onnxruntime.transformers.optimizer` on each `.onnx`: operator fusion, constant folding, ORT L2 passes | `lm-onnx`, `cond-decoder` | ~5-15% faster on iOS; same file size | None — numerically identical |
+| `--quantize int8` | Weight quantization via `onnxruntime.quantization.quantize_dynamic` (ONNX) and `coremltools.optimize.coreml.linear_quantize_weights` (CoreML) | all three v4 stages | **~4× smaller files**, ~2-3× faster decode on iOS | Modest (lm-onnx logits cos sim drops to ~0.97 vs fp32). Use for size-constrained ship targets; validate per artifact. |
+
+A typical "ship to iPhone fast" combo:
+
+```bash
+python convert_chatterbox_coreml.py --stage v4 --output-dir ./out \
+    --cfm-steps 1 --optimize-graph --quantize int8
+```
+
+…produces a bundle in the ~1 GB range (vs ~3.3 GB at fp32) that runs
+materially faster on-device. The validator reports cos sims after each
+transformation so you can decide where to stop.
+
 ## Why CoreML *and* ONNX (and not just one)
 
 The Swift consumer on iPhone runs *both* CoreML and ONNX Runtime — each stage
