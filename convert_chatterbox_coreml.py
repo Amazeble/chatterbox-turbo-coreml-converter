@@ -1182,6 +1182,127 @@ def convert_language_model_onnx(model, output_dir, validate=False, reference_dir
         validate_language_model_onnx(model, out_path, reference_dir=reference_dir)
 
 
+def convert_language_model_coreml(model, output_dir, validate=False):
+    """Native CoreML port of language_model_single.onnx.
+
+    Uses the same _LanguageModelWrapper as the ONNX path — just traces it
+    through torch.jit.trace and runs it through coremltools.convert
+    instead of torch.onnx.export. The Swift consumer would then load
+    `language_model_single.mlpackage` via MLModel and call .prediction
+    per decode step.
+
+    Output: out/language_model_single.mlpackage
+    """
+    print("\n=== Converting language_model_single.mlpackage (CoreML) ===")
+    out_path = os.path.join(output_dir, "language_model_single.mlpackage")
+
+    wrapper = _LanguageModelWrapper(model.t3)
+    wrapper.train(False)
+
+    # Same fixture as the ONNX path; CoreML needs concrete shapes for trace.
+    past_len = 10
+    embeds_t = torch.randn(1, 1, GPT2_HIDDEN, dtype=torch.float32) * 0.02
+    mask_t = torch.ones(1, past_len + 1, dtype=torch.int64)
+    pos_t = torch.tensor([[past_len]], dtype=torch.int64)
+    flat_pkv_t = []
+    for _ in range(GPT2_LAYERS):
+        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
+        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
+
+    input_names, output_names = _lm_onnx_io_names()
+
+    print(f"  Tracing with past_len={past_len}...")
+    with torch.no_grad():
+        traced = torch.jit.trace(
+            wrapper, (embeds_t, mask_t, pos_t, *flat_pkv_t), check_trace=False,
+        )
+
+    print("  Converting to CoreML (FP32, iOS18, compute_units=ALL)...")
+    past_len_dim = ct.RangeDim(lower_bound=1, upper_bound=2048, default=past_len)
+    total_seq_dim = ct.RangeDim(lower_bound=2, upper_bound=2049, default=past_len + 1)
+    inputs = [
+        ct.TensorType(name="inputs_embeds", shape=(1, 1, GPT2_HIDDEN), dtype=np.float32),
+        ct.TensorType(name="attention_mask", shape=ct.Shape(shape=(1, total_seq_dim)), dtype=np.int32),
+        ct.TensorType(name="position_ids", shape=(1, 1), dtype=np.int32),
+    ]
+    for i in range(GPT2_LAYERS):
+        inputs.append(ct.TensorType(
+            name=f"past_key_values.{i}.key",
+            shape=ct.Shape(shape=(1, GPT2_HEADS, past_len_dim, GPT2_HEAD_DIM)),
+            dtype=np.float32,
+        ))
+        inputs.append(ct.TensorType(
+            name=f"past_key_values.{i}.value",
+            shape=ct.Shape(shape=(1, GPT2_HEADS, past_len_dim, GPT2_HEAD_DIM)),
+            dtype=np.float32,
+        ))
+    outputs_decl = [ct.TensorType(name=n, dtype=np.float32) for n in output_names]
+
+    mlmodel = ct.convert(
+        traced,
+        inputs=inputs,
+        outputs=outputs_decl,
+        compute_precision=ct.precision.FLOAT32,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    if os.path.exists(out_path):
+        shutil.rmtree(out_path)
+    mlmodel.save(out_path)
+    size_mb = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _, files in os.walk(out_path) for f in files
+    ) / 1e6
+    print(f"  Saved {out_path} ({size_mb:.1f} MB)")
+
+    if validate:
+        validate_language_model_coreml(model, out_path)
+
+
+def validate_language_model_coreml(model, our_path):
+    print("\n  --- language_model_single.mlpackage validation ---")
+    embeds, mask, pos, kv_pairs = _make_fixture_lm_onnx(seed=0, past_len=10)
+
+    # CoreML normalizes dots to underscores in input names — use the
+    # underscored form when feeding predict().
+    inputs = {
+        "inputs_embeds": embeds,
+        "attention_mask": mask.astype(np.int32),
+        "position_ids": pos.astype(np.int32),
+    }
+    for i, (k, v) in enumerate(kv_pairs):
+        inputs[f"past_key_values_{i}_key"] = k
+        inputs[f"past_key_values_{i}_value"] = v
+
+    # Load + predict
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_pkg = os.path.join(tmp, "language_model_single.mlpackage")
+        shutil.copytree(our_path, tmp_pkg)
+        ml = ct.models.MLModel(tmp_pkg, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+        our_out = ml.predict(inputs)
+    our_logits = np.asarray(our_out["logits"], dtype=np.float32)
+
+    # PyTorch reference
+    with torch.no_grad():
+        wrapper = _LanguageModelWrapper(model.t3)
+        wrapper.train(False)
+        t_inputs = (
+            torch.from_numpy(embeds),
+            torch.from_numpy(mask),
+            torch.from_numpy(pos),
+            *[torch.from_numpy(arr) for kv in kv_pairs for arr in kv],
+        )
+        ref_logits = wrapper(*t_inputs)[0].detach().cpu().numpy()
+
+    ok = _compare_outputs("logits", our_logits, ref_logits, cos_min=0.999, atol=5e-3)
+    print(f"\n  --- iOS compatibility ---")
+    ok &= _check_xcrun_coremlcompiler(our_path)
+    ok &= _try_ane_compute(our_path, inputs)
+    print(f"\n  language_model_single.mlpackage: {'READY' if ok else 'NOT READY'}")
+    return ok
+
+
 def validate_language_model_onnx(model, our_path, reference_dir=None):
     print("\n  --- language_model_single.onnx validation ---")
 
@@ -1405,13 +1526,19 @@ def convert_prefill(model, output_dir, validate=False, reference_dir=None,
     # FLOAT32 matches the HF reference T3Prefill.mlmodelc weight precision
     # (1.5 GB weight.bin = 4 bytes/param). FLOAT16 cuts that in half but the
     # iPhone happily runs FP32 too and the HF copy is what's been validated
-    # device-side. Swift selects compute_units at load time (cpuAndGPU).
+    # device-side.
+    #
+    # compute_units=ALL lets the runtime bid for ANE in addition to CPU and
+    # GPU. The Swift consumer picks the actual dispatch via
+    # MLModelConfiguration.computeUnits — declaring ALL here just keeps ANE
+    # eligible. Previous version pinned CPU_AND_GPU which made ANE bidding
+    # impossible regardless of the Swift config.
     mlmodel = ct.convert(
         traced,
         inputs=inputs,
         outputs=outputs,
         compute_precision=ct.precision.FLOAT32,
-        compute_units=ct.ComputeUnit.CPU_AND_GPU,
+        compute_units=ct.ComputeUnit.ALL,
         minimum_deployment_target=ct.target.iOS18,
     )
 
@@ -2336,12 +2463,226 @@ def validate_conditional_decoder(model, our_path, reference_dir=None, cfm_steps:
 
 
 # ===========================================================================
+# ANE compute-plan reporting (--stage ane-report)
+# ===========================================================================
+#
+# Answers: "if I were to put each artifact through ANE on iPhone, what
+# fraction of compute actually lands on ANE vs falls back to CPU/GPU?"
+# Useful for deciding whether converting an ONNX model to native CoreML
+# (for ANE access) is worth the engineering effort.
+
+
+# Op types that ANE handles natively (rough but well-known list). Used for
+# ONNX op-type classification — we can't directly query ANE eligibility on
+# ONNX models from Python.
+_ANE_FRIENDLY_ONNX_OPS = {
+    "Conv", "ConvTranspose", "MatMul", "Gemm", "LayerNormalization",
+    "BatchNormalization", "InstanceNormalization", "Add", "Sub", "Mul",
+    "Div", "Relu", "Sigmoid", "Tanh", "Softmax", "GlobalAveragePool",
+    "AveragePool", "MaxPool", "Concat", "Split", "Reshape", "Transpose",
+    "Gather", "Slice", "Squeeze", "Unsqueeze", "Cast", "ReduceMean",
+    "ReduceSum", "Pow", "Sqrt", "Exp", "Log", "Sin", "Cos", "Erf",
+    "QLinearMatMul", "QLinearConv", "DynamicQuantizeLinear",
+    "DequantizeLinear", "QuantizeLinear",
+}
+
+# Op types that consistently fall back to CPU/GPU on ANE
+_ANE_FALLBACK_ONNX_OPS = {
+    "STFT", "RandomNormal", "RandomNormalLike", "RandomUniform",
+    "Complex", "ScatterND", "ScatterElements", "Where", "Loop", "If",
+    "ConstantOfShape",  # often, depends on context
+}
+
+
+def _ane_report_coreml(mlpackage_path: str) -> None:
+    """Per-op ANE/GPU/CPU dispatch report for a .mlpackage."""
+    from coremltools.models import compute_plan as cp
+
+    print(f"\n=== ANE compute plan: {os.path.basename(mlpackage_path)} ===")
+    if shutil.which("xcrun") is None:
+        print("  SKIP: xcrun not installed; can't compile to .mlmodelc")
+        return
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        proc = subprocess.run(
+            ["xcrun", "coremlcompiler", "compile", mlpackage_path, tmpdir],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            print(f"  coremlcompiler failed: {proc.stderr.strip()[:300]}")
+            return
+        compiled = next(
+            (p for p in os.listdir(tmpdir) if p.endswith(".mlmodelc")), None
+        )
+        if compiled is None:
+            print(f"  coremlcompiler produced no .mlmodelc (dir contents: {os.listdir(tmpdir)})")
+            return
+        compiled_path = os.path.join(tmpdir, compiled)
+
+        try:
+            plan = cp.MLComputePlan.load_from_path(
+                compiled_path, compute_units=ct.ComputeUnit.ALL,
+            )
+        except Exception as exc:
+            print(f"  MLComputePlan.load_from_path failed: {str(exc)[:200]}")
+            return
+
+        pref_counts = {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0}
+        supp_counts = {"ANE": 0, "GPU": 0, "CPU": 0}  # union of supported per op
+        op_type_pref: dict[str, dict[str, int]] = {}
+        op_type_ane_supported: dict[str, int] = {}
+
+        def _classify_device(device) -> str:
+            if device is None:
+                return "Unknown"
+            name = type(device).__name__
+            if "NeuralEngine" in name:
+                return "ANE"
+            if "GPU" in name:
+                return "GPU"
+            if "CPU" in name:
+                return "CPU"
+            return "Unknown"
+
+        def _walk_ops(block):
+            for op in block.operations:
+                yield op
+                for inner in op.blocks:
+                    yield from _walk_ops(inner)
+
+        program = plan.model_structure.program
+        if program is None:
+            print("  Model is not an MLProgram; per-op breakdown unavailable.")
+            return
+
+        for fn_name, fn in program.functions.items():
+            for op in _walk_ops(fn.block):
+                usage = plan.get_compute_device_usage_for_mlprogram_operation(op)
+                if usage is None:
+                    pref_counts["Unknown"] += 1
+                    continue
+                pref = _classify_device(usage.preferred_compute_device)
+                pref_counts[pref] += 1
+
+                supp = {_classify_device(d) for d in (usage.supported_compute_devices or [])}
+                for d in supp & {"ANE", "GPU", "CPU"}:
+                    supp_counts[d] += 1
+
+                op_type_pref.setdefault(op.operator_name, {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0})
+                op_type_pref[op.operator_name][pref] += 1
+                if "ANE" in supp:
+                    op_type_ane_supported[op.operator_name] = op_type_ane_supported.get(op.operator_name, 0) + 1
+
+        total = sum(pref_counts.values())
+        if total == 0:
+            print("  No operations found in the program.")
+            return
+
+        print(f"  Total ops: {total}")
+        print(f"  Preferred dispatch (what the runtime would actually pick on this Mac):")
+        for dev in ("ANE", "GPU", "CPU", "Unknown"):
+            c = pref_counts[dev]
+            if c:
+                print(f"    {dev:7s} {c:4d}  ({100 * c / total:5.1f}%)")
+        print(f"  Supported (ops eligible for each device, not necessarily preferred):")
+        for dev in ("ANE", "GPU", "CPU"):
+            c = supp_counts[dev]
+            print(f"    {dev:7s} {c:4d}  ({100 * c / total:5.1f}%)")
+        ane_potential = supp_counts["ANE"] - pref_counts["ANE"]
+        if ane_potential > 0:
+            print(f"  → {ane_potential} ops ({100 * ane_potential / total:.1f}%) are ANE-eligible "
+                  "but not preferred here. iPhone (newer ANE generation) may schedule them on ANE.")
+
+        # Top op types where ANE *isn't* preferred but might be supported
+        gap_types = sorted(
+            (
+                (op_type, op_type_ane_supported.get(op_type, 0), v)
+                for op_type, v in op_type_pref.items()
+                if v.get("ANE", 0) == 0  # not currently going to ANE
+            ),
+            key=lambda x: -(x[1] or sum(x[2].values())),
+        )[:8]
+        if gap_types:
+            print(f"  Top op types NOT preferring ANE:")
+            for op_type, ane_eligible, where in gap_types:
+                bits = " / ".join(f"{d}:{where[d]}" for d in ("GPU", "CPU", "Unknown") if where[d])
+                tag = f"ANE-supported on {ane_eligible}" if ane_eligible else "not ANE-eligible"
+                print(f"    {op_type:35s} ({bits})  [{tag}]")
+
+
+def _ane_report_onnx(onnx_path: str) -> None:
+    """Op-type classification for an ONNX model.
+
+    ONNX models don't run on ANE directly via Python. On iPhone they can
+    be routed through CoreMLExecutionProvider in ORT to get ANE access
+    where the op is supported. This report estimates what fraction of the
+    graph WOULD land on ANE under that routing, based on a static op-type
+    classification (well-known ANE-friendly vs ANE-fallback ops).
+    """
+    import onnx
+    from collections import Counter
+
+    print(f"\n=== ANE estimate (via CoreML EP): {os.path.basename(onnx_path)} ===")
+    print(f"  ONNX models route through ORT's CoreMLExecutionProvider on iPhone")
+    print(f"  to reach ANE. The breakdown below is a static op-type estimate.")
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    op_counts = Counter(n.op_type for n in model.graph.node)
+    total = sum(op_counts.values())
+
+    ane_count = sum(c for op, c in op_counts.items() if op in _ANE_FRIENDLY_ONNX_OPS)
+    fallback_count = sum(c for op, c in op_counts.items() if op in _ANE_FALLBACK_ONNX_OPS)
+    unknown_count = total - ane_count - fallback_count
+
+    print(f"  Total ops: {total}")
+    print(f"    ANE-friendly  {ane_count:5d}  ({100 * ane_count / total:5.1f}%)")
+    print(f"    Fallback      {fallback_count:5d}  ({100 * fallback_count / total:5.1f}%)")
+    print(f"    Unknown       {unknown_count:5d}  ({100 * unknown_count / total:5.1f}%)  (heuristic uncertain — could go either way)")
+
+    if fallback_count:
+        fb = sorted(
+            ((op, op_counts[op]) for op in op_counts if op in _ANE_FALLBACK_ONNX_OPS),
+            key=lambda x: -x[1],
+        )
+        print(f"  Top ANE-blocking op types:")
+        for op, c in fb[:8]:
+            print(f"    {op:30s} {c:5d}")
+
+
+def run_ane_report(output_dir: str) -> None:
+    """Scan `output_dir` for known v4 artifacts and report ANE plans / estimates."""
+    print("\n=== ANE residency report ===")
+    print("Helps answer: 'is converting more of the pipeline to native CoreML")
+    print("(to access ANE) worth the engineering work?'")
+
+    coreml_artifacts = [
+        ("T3Prefill.mlpackage", "v4 prefill"),
+        ("language_model_single.mlpackage", "experimental native CoreML lm"),
+    ]
+    for name, label in coreml_artifacts:
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            _ane_report_coreml(path)
+        else:
+            print(f"\n  (no {name} at {path} — {label})")
+
+    onnx_dir = os.path.join(output_dir, "onnx")
+    for name in ("language_model_single.onnx", "conditional_decoder_single.onnx"):
+        path = os.path.join(onnx_dir, name)
+        if os.path.exists(path):
+            _ane_report_onnx(path)
+        else:
+            print(f"\n  (no {name} at {path})")
+
+
+# ===========================================================================
 # MAIN
 # ===========================================================================
 
 V1_STAGES = ("t3", "s3", "vocoder", "all")
 V4_STAGES = ("prefill", "lm-onnx", "cond-decoder", "v4")
-ALL_STAGES = V1_STAGES + V4_STAGES + ("all-v4",)
+EXPERIMENTAL_STAGES = ("lm-coreml",)  # native CoreML lm prototype
+ALL_STAGES = V1_STAGES + V4_STAGES + EXPERIMENTAL_STAGES + ("all-v4", "ane-report")
 
 
 def main():
@@ -2355,7 +2696,9 @@ def main():
         help=(
             "Which stage to convert. v1: t3, s3, vocoder, all. "
             "v4 (matches HF release): prefill, lm-onnx, cond-decoder, v4 (all three). "
-            "all-v4: v1 stages + v4 stages."
+            "all-v4: v1 stages + v4 stages. "
+            "ane-report: scan existing artifacts in --output-dir and print "
+            "per-op ANE/GPU/CPU dispatch (CoreML) / ANE eligibility estimate (ONNX)."
         ),
     )
     parser.add_argument(
@@ -2438,7 +2781,12 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    is_v4 = args.stage in V4_STAGES or args.stage == "all-v4"
+    # ane-report runs against existing artifacts; no model load needed.
+    if args.stage == "ane-report":
+        run_ane_report(args.output_dir)
+        return
+
+    is_v4 = args.stage in V4_STAGES or args.stage == "all-v4" or args.stage in EXPERIMENTAL_STAGES
     is_v1 = args.stage in V1_STAGES or args.stage == "all-v4"
 
     v1_model = None
@@ -2488,6 +2836,11 @@ def main():
             cfm_steps=args.cfm_steps,
             optimize_graph=args.optimize_graph,
             quantize=args.quantize,
+        )
+    if args.stage == "lm-coreml":
+        convert_language_model_coreml(
+            v4_model, args.output_dir,
+            validate=args.validate,
         )
 
     print("\n=== Done ===")

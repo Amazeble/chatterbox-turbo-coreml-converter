@@ -143,6 +143,59 @@ your bundle), and run a real-device A/B before changing anything on HF.
   ops fall back to CPU on ANE that FP32 versions handled. Measure
   on-device.
 
+### Experimental: native CoreML `lm` (`--stage lm-coreml`)
+
+Bypasses ONNX Runtime entirely for the language-model decode step,
+producing `out/language_model_single.mlpackage` from the same wrapper
+we use for the ONNX path. The idea: if CoreML can route the decode
+through ANE on iPhone, that could be faster than ORT on CPU.
+
+**M1 result (this Mac):** experimental. The native CoreML model
+runs correctly (logits cos sim 1.0 vs PyTorch), but is **~4× slower
+than the INT8 ONNX path**:
+
+```
+  CoreML lm.mlpackage on CPU_AND_GPU     mean=  24.4 ms per token
+  CoreML lm.mlpackage on ALL (M1: GPU)   mean=  25.4 ms per token
+  ORT lm.onnx (INT8) on CPU              mean=   6.3 ms per token
+```
+
+The reason: `--stage ane-report` shows **zero** ops in the native
+CoreML lm are ANE-eligible on M1 — the `ios18.*` MIL op set (reshape,
+linear, transpose, layer_norm, sdpa, gelu, concat) wasn't supported by
+M1's older ANE. So CoreML falls back to GPU, and the GPU's per-call
+overhead loses badly to ORT's INT8 CPU path on the per-token loop.
+
+**iPhone 17 may invert this** — its ANE generation supports more ops
+and is much more performant than M1's. The static op-type estimate
+on the equivalent ONNX (`--stage ane-report` → `language_model_single.onnx`)
+says 93% of ops would land on ANE under ORT's CoreMLExecutionProvider
+routing on iPhone. Whether the native CoreML version beats that
+routed-ORT path on iPhone is an empirical question that needs
+device testing.
+
+**Recommendation today: ship ORT INT8 on Mac, treat `--stage lm-coreml`
+as a research artifact for on-device benchmarking on iPhone 17.**
+
+### Further speedups (Swift-side, out of scope for this repo)
+
+The converter prepares the artifacts; the Swift consumer ultimately
+decides how to schedule and dispatch them. The biggest remaining
+speedups for an iPhone app are on that side. Tracking them here so the
+recipe is visible from one place:
+
+| Idea | Estimated impact | Effort | Notes |
+|---|---|---|---|
+| **Streaming the cond_decoder** | Time-to-first-audio drops from ~1300 ms → ~250 ms | 1-2 weeks Swift | Start vocoding as soon as the first chunk of mel frames is ready; play that buffer while continuing decode. **Biggest single user-facing win** — turns "feels slow" into "feels instant" without changing any model. |
+| **`CoreMLExecutionProvider` for both `.onnx` models in ORT** | 2-5× faster decode and synth on iPhone (puts ~93% of `lm.onnx` ops on ANE per our `--stage ane-report` estimate) | Half a day | Swift configures ORT session with `ORTCoreMLExecutionProviderOptions(useCPUAndGPU: false)`. ORT routes supported ops to CoreML (which dispatches to ANE/GPU), CPU for the rest. **Highest ROI ANE play, zero converter changes.** |
+| **`MLModelConfiguration.computeUnits = .all`** for `T3Prefill.mlpackage` | Lets ANE bid for the prefill compute | Trivial | Currently the converter bakes `compute_units=CPU_AND_GPU` at conversion time; the easy converter-side companion change is to re-export with `compute_units=ALL`, then Swift loads with `.all`. |
+| **Pre-warm at app launch** | Eliminates 1-3 s cold-start on first call | Trivial | Load the models + dummy-predict on startup. |
+| **Speculative decoding** with a tiny draft model | 1.5-2× decode speedup | Real engineering | Draft model predicts N tokens ahead; main model verifies in one pass. Needs a smaller distilled checkpoint or careful tail-token sharing. |
+
+To inform decisions: run `--stage ane-report` against your current
+`out/` to see the static op-type breakdown per artifact, and what
+fraction would land on ANE under CoreML EP routing.
+
 ## Why CoreML *and* ONNX (and not just one)
 
 The Swift consumer on iPhone runs *both* CoreML and ONNX Runtime — each stage
