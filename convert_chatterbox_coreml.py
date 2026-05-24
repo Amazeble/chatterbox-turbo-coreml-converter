@@ -1182,6 +1182,127 @@ def convert_language_model_onnx(model, output_dir, validate=False, reference_dir
         validate_language_model_onnx(model, out_path, reference_dir=reference_dir)
 
 
+def convert_language_model_coreml(model, output_dir, validate=False):
+    """Native CoreML port of language_model_single.onnx.
+
+    Uses the same _LanguageModelWrapper as the ONNX path — just traces it
+    through torch.jit.trace and runs it through coremltools.convert
+    instead of torch.onnx.export. The Swift consumer would then load
+    `language_model_single.mlpackage` via MLModel and call .prediction
+    per decode step.
+
+    Output: out/language_model_single.mlpackage
+    """
+    print("\n=== Converting language_model_single.mlpackage (CoreML) ===")
+    out_path = os.path.join(output_dir, "language_model_single.mlpackage")
+
+    wrapper = _LanguageModelWrapper(model.t3)
+    wrapper.train(False)
+
+    # Same fixture as the ONNX path; CoreML needs concrete shapes for trace.
+    past_len = 10
+    embeds_t = torch.randn(1, 1, GPT2_HIDDEN, dtype=torch.float32) * 0.02
+    mask_t = torch.ones(1, past_len + 1, dtype=torch.int64)
+    pos_t = torch.tensor([[past_len]], dtype=torch.int64)
+    flat_pkv_t = []
+    for _ in range(GPT2_LAYERS):
+        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
+        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
+
+    input_names, output_names = _lm_onnx_io_names()
+
+    print(f"  Tracing with past_len={past_len}...")
+    with torch.no_grad():
+        traced = torch.jit.trace(
+            wrapper, (embeds_t, mask_t, pos_t, *flat_pkv_t), check_trace=False,
+        )
+
+    print("  Converting to CoreML (FP32, iOS18, compute_units=ALL)...")
+    past_len_dim = ct.RangeDim(lower_bound=1, upper_bound=2048, default=past_len)
+    total_seq_dim = ct.RangeDim(lower_bound=2, upper_bound=2049, default=past_len + 1)
+    inputs = [
+        ct.TensorType(name="inputs_embeds", shape=(1, 1, GPT2_HIDDEN), dtype=np.float32),
+        ct.TensorType(name="attention_mask", shape=ct.Shape(shape=(1, total_seq_dim)), dtype=np.int32),
+        ct.TensorType(name="position_ids", shape=(1, 1), dtype=np.int32),
+    ]
+    for i in range(GPT2_LAYERS):
+        inputs.append(ct.TensorType(
+            name=f"past_key_values.{i}.key",
+            shape=ct.Shape(shape=(1, GPT2_HEADS, past_len_dim, GPT2_HEAD_DIM)),
+            dtype=np.float32,
+        ))
+        inputs.append(ct.TensorType(
+            name=f"past_key_values.{i}.value",
+            shape=ct.Shape(shape=(1, GPT2_HEADS, past_len_dim, GPT2_HEAD_DIM)),
+            dtype=np.float32,
+        ))
+    outputs_decl = [ct.TensorType(name=n, dtype=np.float32) for n in output_names]
+
+    mlmodel = ct.convert(
+        traced,
+        inputs=inputs,
+        outputs=outputs_decl,
+        compute_precision=ct.precision.FLOAT32,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    if os.path.exists(out_path):
+        shutil.rmtree(out_path)
+    mlmodel.save(out_path)
+    size_mb = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _, files in os.walk(out_path) for f in files
+    ) / 1e6
+    print(f"  Saved {out_path} ({size_mb:.1f} MB)")
+
+    if validate:
+        validate_language_model_coreml(model, out_path)
+
+
+def validate_language_model_coreml(model, our_path):
+    print("\n  --- language_model_single.mlpackage validation ---")
+    embeds, mask, pos, kv_pairs = _make_fixture_lm_onnx(seed=0, past_len=10)
+
+    # CoreML normalizes dots to underscores in input names — use the
+    # underscored form when feeding predict().
+    inputs = {
+        "inputs_embeds": embeds,
+        "attention_mask": mask.astype(np.int32),
+        "position_ids": pos.astype(np.int32),
+    }
+    for i, (k, v) in enumerate(kv_pairs):
+        inputs[f"past_key_values_{i}_key"] = k
+        inputs[f"past_key_values_{i}_value"] = v
+
+    # Load + predict
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_pkg = os.path.join(tmp, "language_model_single.mlpackage")
+        shutil.copytree(our_path, tmp_pkg)
+        ml = ct.models.MLModel(tmp_pkg, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+        our_out = ml.predict(inputs)
+    our_logits = np.asarray(our_out["logits"], dtype=np.float32)
+
+    # PyTorch reference
+    with torch.no_grad():
+        wrapper = _LanguageModelWrapper(model.t3)
+        wrapper.train(False)
+        t_inputs = (
+            torch.from_numpy(embeds),
+            torch.from_numpy(mask),
+            torch.from_numpy(pos),
+            *[torch.from_numpy(arr) for kv in kv_pairs for arr in kv],
+        )
+        ref_logits = wrapper(*t_inputs)[0].detach().cpu().numpy()
+
+    ok = _compare_outputs("logits", our_logits, ref_logits, cos_min=0.999, atol=5e-3)
+    print(f"\n  --- iOS compatibility ---")
+    ok &= _check_xcrun_coremlcompiler(our_path)
+    ok &= _try_ane_compute(our_path, inputs)
+    print(f"\n  language_model_single.mlpackage: {'READY' if ok else 'NOT READY'}")
+    return ok
+
+
 def validate_language_model_onnx(model, our_path, reference_dir=None):
     print("\n  --- language_model_single.onnx validation ---")
 
@@ -2534,11 +2655,16 @@ def run_ane_report(output_dir: str) -> None:
     print("Helps answer: 'is converting more of the pipeline to native CoreML")
     print("(to access ANE) worth the engineering work?'")
 
-    prefill = os.path.join(output_dir, "T3Prefill.mlpackage")
-    if os.path.exists(prefill):
-        _ane_report_coreml(prefill)
-    else:
-        print(f"\n  (no T3Prefill.mlpackage at {prefill} — run --stage prefill first)")
+    coreml_artifacts = [
+        ("T3Prefill.mlpackage", "v4 prefill"),
+        ("language_model_single.mlpackage", "experimental native CoreML lm"),
+    ]
+    for name, label in coreml_artifacts:
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            _ane_report_coreml(path)
+        else:
+            print(f"\n  (no {name} at {path} — {label})")
 
     onnx_dir = os.path.join(output_dir, "onnx")
     for name in ("language_model_single.onnx", "conditional_decoder_single.onnx"):
@@ -2555,7 +2681,8 @@ def run_ane_report(output_dir: str) -> None:
 
 V1_STAGES = ("t3", "s3", "vocoder", "all")
 V4_STAGES = ("prefill", "lm-onnx", "cond-decoder", "v4")
-ALL_STAGES = V1_STAGES + V4_STAGES + ("all-v4", "ane-report")
+EXPERIMENTAL_STAGES = ("lm-coreml",)  # native CoreML lm prototype
+ALL_STAGES = V1_STAGES + V4_STAGES + EXPERIMENTAL_STAGES + ("all-v4", "ane-report")
 
 
 def main():
@@ -2659,7 +2786,7 @@ def main():
         run_ane_report(args.output_dir)
         return
 
-    is_v4 = args.stage in V4_STAGES or args.stage == "all-v4"
+    is_v4 = args.stage in V4_STAGES or args.stage == "all-v4" or args.stage in EXPERIMENTAL_STAGES
     is_v1 = args.stage in V1_STAGES or args.stage == "all-v4"
 
     v1_model = None
@@ -2709,6 +2836,11 @@ def main():
             cfm_steps=args.cfm_steps,
             optimize_graph=args.optimize_graph,
             quantize=args.quantize,
+        )
+    if args.stage == "lm-coreml":
+        convert_language_model_coreml(
+            v4_model, args.output_dir,
+            validate=args.validate,
         )
 
     print("\n=== Done ===")
