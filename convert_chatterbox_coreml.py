@@ -2111,8 +2111,12 @@ def _quantize_coreml_int8(mlpackage_path: str) -> None:
     )
     quantized = linear_quantize_weights(mlmodel, config=config)
 
-    # Replace original .mlpackage directory
-    tmp_path = mlpackage_path + ".int8.tmp"
+    # Replace original .mlpackage directory. CoreML save() rejects any
+    # extension other than .mlpackage, so use a sibling temp path that
+    # keeps the extension and rename after.
+    parent = os.path.dirname(mlpackage_path) or "."
+    base = os.path.basename(mlpackage_path)
+    tmp_path = os.path.join(parent, f".{base}.int8.tmp.mlpackage")
     if os.path.exists(tmp_path):
         shutil.rmtree(tmp_path)
     quantized.save(tmp_path)
@@ -2136,15 +2140,22 @@ def _quantize_onnx_int8(onnx_path: str) -> None:
     validator. iOS ORT supports the resulting QLinear ops natively.
     """
     from onnxruntime.quantization import quantize_dynamic, QuantType
+    from onnx import TensorProto
 
     with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
         tmp_path = tmp.name
     try:
+        # DefaultTensorType=FLOAT handles graphs where the quantizer can't
+        # infer types for some MatMul outputs — happens on the
+        # conditional_decoder where the encoder doesn't carry full shape
+        # annotation through the chain. Pre-running shape inference would
+        # also work but is heavier.
         quantize_dynamic(
             model_input=onnx_path,
             model_output=tmp_path,
             weight_type=QuantType.QInt8,
             per_channel=False,
+            extra_options={"DefaultTensorType": TensorProto.FLOAT},
         )
         # Replace original .onnx (and clean up any old external data file —
         # quantized weights are small enough to inline).
