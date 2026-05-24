@@ -4,6 +4,13 @@
 
 # chatterbox-turbo-coreml-converter
 
+> **Pre-built artifacts on Hugging Face:**
+> [ebrinz/chatterbox-turbo-coreml](https://huggingface.co/ebrinz/chatterbox-turbo-coreml)
+> — `T3Prefill.mlpackage`, `onnx/language_model_single.onnx`,
+> `onnx/conditional_decoder_single.onnx` ready to drop into a Swift app.
+> This repo is the conversion script that produces them, plus benchmarks,
+> validation harness, and an alternative v1 pure-CoreML pipeline.
+
 Converts ResembleAI's [Chatterbox Turbo](https://huggingface.co/ResembleAI/chatterbox-turbo)
 TTS model to artifacts that run on Apple Silicon — both Macs (M1+) and iPhones
 (via on-device CoreML + ONNX Runtime).
