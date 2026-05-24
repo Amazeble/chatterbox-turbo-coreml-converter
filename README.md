@@ -15,6 +15,11 @@ Converts ResembleAI's [Chatterbox Turbo](https://huggingface.co/ResembleAI/chatt
 TTS model to artifacts that run on Apple Silicon — both Macs (M1+) and iPhones
 (via on-device CoreML + ONNX Runtime).
 
+> **Reproducing the HF reference:** run with no optimization flags — the
+> default output is bit-/byte-equivalent to what's on Hugging Face.
+> **Shipping to an iPhone app and want it smaller + faster?** Jump to
+> [Proven "ship to iPhone fast" combo](#proven-ship-to-iphone-fast-combo).
+
 Two pipelines are supported:
 
 - **v4 hybrid CoreML + ONNX** *(recommended; matches what ships on iPhone today)*:
