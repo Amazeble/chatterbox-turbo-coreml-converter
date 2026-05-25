@@ -493,6 +493,115 @@ extracted by slicing the feature dimension. Attention masking handles
 unfilled positions (zeros) by setting `attn_mask` to `-1e9` there, so the
 softmax ignores them.
 
+## Gotchas and lessons learned
+
+Hard-won stuff that bit us during this project. Save someone else (or
+future-you) the same hours.
+
+### Dependency landmines
+
+- **`chatterbox-tts 0.1.7` hard-pins `torch==2.6.0` and `transformers==5.2.0`.**
+  Both pins are unnecessarily strict (works fine with newer versions in
+  practice). Install with `--no-deps` then bring your own deps. Git head
+  is currently more broken than 0.1.7 — don't follow the temptation to
+  upgrade.
+- **`LLAMA_CONFIGS` is missing `GPT2_medium` upstream**, even though
+  chatterbox's own `tts_turbo.py` references it. The converter
+  monkey-patches the entry in at runtime (`_ensure_chatterbox_gpt2_config`).
+- **`perth` (Resemble's watermarker) silently sets `PerthImplicitWatermarker
+  = None` if it can't import its inner module.** That inner module
+  imports `pkg_resources`, which `setuptools >= 81` removed. Pin
+  `setuptools<81` if you need perth (we need it for `ChatterboxTurboTTS.from_pretrained`).
+- **`coremltools 9.0` is tested with `torch 2.7.1`.** Torch 2.8 prints a
+  warning; 2.9 isn't tested at all. We use 2.7-2.8 in the main path
+  and 2.9 only in `.venv-torch29` for the Stage C dynamo experiment.
+
+### Architectural surprises
+
+- **Chatterbox Turbo's weights are GPT-2, not Llama**, despite the
+  YAML's `llama_config_name: Llama_520M`. The `tfmr.h.*.attn.c_attn` /
+  `wpe` parameter names give it away. The override `llama_config_name =
+  "GPT2_medium"` in `tts_turbo.py` flips the backbone.
+- **HF's `T3Prefill.mlmodelc` snapshot is missing `Manifest.json`** —
+  you can't load it directly with `ct.models.MLModel()` for cross-validation.
+  Validators that need to numerically compare ours-vs-HF on `.mlmodelc`
+  artifacts will fail to load the HF side; fall back to PyTorch reference.
+- **HF references built with `pytorch 2.9.0 + dynamo + opset 17 +
+  com.microsoft.MultiHeadAttention`.** We can't get the legacy
+  TorchScript exporter to emit equivalent ops, and our torch 2.8 dynamo
+  hits separate bugs. The `--torch29` mode in `.venv-torch29` gets
+  closest; documented in "Stage C: --torch29 mode" above.
+
+### Export-time trace hazards
+
+- **`torch.onnx.export(dynamo=False)` recurses infinitely through
+  functorch vmap** on HF's `DynamicCache`. Bypass by writing a manual
+  attention forward (`_LanguageModelWrapper._block_forward`) instead of
+  calling `GPT2Block.forward`.
+- **`torch.onnx.export(dynamo=True)` mis-tracks dtypes on `prims.signbit`**
+  inside HiFTGenerator's `SineGen`. Bypass by patching `SineGen.forward`
+  to a functional version (no in-place writes, no `Uniform.sample()`,
+  no `randn_like`).
+- **HiFTGenerator's `_stft` / `_istft` use complex tensors** which the
+  legacy ONNX exporter at opset 17 can't emit. Bypass with manual
+  primitive implementations (zero-stub `_stft` for our zero-source path;
+  manual IDFT + `conv_transpose1d` overlap-add for `_istft`).
+- **`EspnetRelPositionalEncoding.extend_pe` writes to `self.pe` in-place
+  every forward.** Both legacy and dynamo trip on this. The `__init__`
+  already populates PE to `max_len=5000` which is plenty — monkey-patch
+  `extend_pe` to a no-op for export.
+- **`add_optional_chunk_mask` has a `.item()` call** that creates a
+  data-dependent guard. Doesn't matter for batch=1 full-sequence (the
+  branch is never taken); patch the function to skip it during export.
+- **chatterbox uses `nn.utils.parametrize` (new API), not legacy
+  `weight_norm`.** Convs have `parametrizations.weight[0] = _WeightNorm()`
+  instead of `weight_v` / `weight_g`. Use
+  `torch.nn.utils.parametrize.remove_parametrizations(mod, "weight",
+  leave_parametrized=True)` to fuse. The legacy
+  `torch.nn.utils.remove_weight_norm` silently does nothing.
+- **`HiFTGenerator.remove_weight_norm()` is half-broken** — it calls
+  `self.m_source.remove_weight_norm()` but `SourceModuleHnNSF` doesn't
+  implement that method. Calling the wholesale removeleaves things
+  half-stripped on AttributeError. Strip each conv individually.
+
+### Quantize / optimize gotchas
+
+- **`onnxruntime.transformers.optimizer` with `model_type='gpt2'` has a
+  postprocess `AttributeError`** on graphs whose Reshape-after-Gemm
+  pattern doesn't match its expectations. Fall back to
+  `only_onnxruntime=True, opt_level=1` (generic ORT passes).
+- **`--optimize-graph` on `cond-decoder` bakes the Conformer
+  relative-attention shape** during the skewing operation. The
+  resulting model only runs at the trace-fixture sequence length.
+  Auto-skipped on this stage now.
+- **`quantize_dynamic` on `cond-decoder` fails on the estimator's
+  time-MLP MatMul** with a shape-inference error, regardless of
+  `op_types_to_quantize`. Auto-skipped. The parametrize fuse above
+  is necessary for any future quantization to even get to the MatMul
+  step (otherwise it fails earlier on Conv weights), so we keep it.
+- **A "successful" bench after a failed quantize doesn't mean
+  quantize worked.** `quantize_dynamic` can fail mid-pipeline, leaving
+  the original (FP32) ONNX in place. The bench loads that and reports
+  success. Always check the post-quantize file size — if it didn't
+  shrink, something went wrong.
+
+### Hardware-specific findings
+
+- **M1's ANE doesn't speak the `ios18.*` MIL op set.** Reshape, linear,
+  transpose, layer_norm, gelu, sdpa, concat — all fall back to GPU/CPU
+  on M1 even with `compute_units=ALL`. Per-op support is much better
+  on newer ANE generations (iPhone 17+).
+- **`compute_units=CPU_AND_GPU` baked at conversion blocks ANE bidding
+  forever**, regardless of `MLModelConfiguration.computeUnits` in Swift.
+  Always bake `compute_units=ALL` for iPhone-bound models.
+- **Native CoreML for `lm` is slower than ORT INT8 CPU on M1** (24 ms vs
+  6 ms per token). On iPhone the picture may invert — only on-device
+  benchmarking tells. The experimental `--stage lm-coreml` produces the
+  artifact for that test.
+- **`save()` rejects `.mlpackage` paths with any other extension.** If
+  you write to a temp path during quantization, the temp must also end
+  in `.mlpackage`.
+
 ## License
 
 This conversion script is released under the [MIT License](LICENSE).
