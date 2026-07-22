@@ -31,7 +31,14 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import coremltools as ct
+
+# Import coremltools conditionally - only needed for CoreML stages
+try:
+    import coremltools as ct
+except ImportError:
+    ct = None
+    print("Note: coremltools not available. CoreML conversion stages will be unavailable, but ONNX export will work.")
+
 from safetensors.torch import save_file as save_safetensors
 
 
@@ -286,22 +293,35 @@ def load_pytorch_model(cache_dir=None):
     return ChatterboxModels(t3=t3, s3gen=s3gen, model_dir=model_dir)
 
 
-def load_pytorch_model_v4(cache_dir=None):
+def load_pytorch_model_v4(cache_dir=None, model_path=None):
     """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained.
 
     This matches the v4 HF artifacts (meanflow-trained s3gen). v4 stages
     (prefill, lm-onnx, cond-decoder) should use this loader.
+    
+    Args:
+        cache_dir: Optional cache directory for HuggingFace downloads
+        model_path: Optional local path to model directory. If provided,
+                    loads from local path instead of downloading.
     """
     _ensure_chatterbox_gpt2_config()
 
-    print("Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('cpu')...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
     from huggingface_hub import snapshot_download
 
-    tts = ChatterboxTurboTTS.from_pretrained("cpu")
+    if model_path is not None:
+        print(f"Loading Chatterbox Turbo from local path: {model_path}...")
+        model_dir = Path(model_path)
+        if not model_dir.exists():
+            raise FileNotFoundError(f"Model path does not exist: {model_path}")
+        tts = ChatterboxTurboTTS.from_pretrained(str(model_dir), local_files_only=True)
+    else:
+        print("Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('cpu')...")
+        tts = ChatterboxTurboTTS.from_pretrained("cpu")
+        model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
+    
     tts.t3.train(False)
     tts.s3gen.train(False)
-    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
     print(f"  Model dir: {model_dir}")
     print("  Models loaded successfully.")
     return ChatterboxModels(t3=tts.t3, s3gen=tts.s3gen, model_dir=model_dir)
@@ -371,6 +391,10 @@ class T3StatefulWrapper(nn.Module):
 def convert_t3(model, output_dir, validate=False):
     """Convert T3 to a single stateful CoreML model with StateType KV cache."""
     print("\n=== Converting T3 Stateful (GPT-2 + KV Cache) ===")
+    if ct is None:
+        print("ERROR: CoreML conversion requires coremltools. Install it or skip CoreML stages.")
+        sys.exit(1)
+
 
     t3_model = model
     t3_model.t3.eval()
@@ -612,6 +636,10 @@ class S3UNetWrapper(nn.Module):
 def convert_s3(model, output_dir, validate=False):
     """Convert S3Encoder and S3UNet to CoreML."""
     print("\n=== Converting S3Encoder (Conformer) ===")
+    if ct is None:
+        print("ERROR: CoreML conversion requires coremltools. Install it or skip CoreML stages.")
+        sys.exit(1)
+
 
     s3gen = model.s3gen
     s3gen.eval()
@@ -900,7 +928,7 @@ def _compare_outputs(
 
 
 def _load_onnx_session(path):
-    """Load an ONNX model with onnxruntime, CPU provider, optimization on."""
+    """Load an ONNX model with onnxruntime (Windows base), CPU provider, optimization on."""
     import onnxruntime as ort
 
     so = ort.SessionOptions()
@@ -1172,7 +1200,7 @@ def convert_language_model_onnx(model, output_dir, validate=False, reference_dir
 
     if optimize_graph:
         _optimize_onnx_graph(
-            out_path, model_type="gpt2",
+            out_path, model_type="bert",
             num_heads=GPT2_HEADS, hidden_size=GPT2_HIDDEN,
         )
     if quantize == "int8":
@@ -1194,6 +1222,10 @@ def convert_language_model_coreml(model, output_dir, validate=False):
     Output: out/language_model_single.mlpackage
     """
     print("\n=== Converting language_model_single.mlpackage (CoreML) ===")
+    if ct is None:
+        print("ERROR: CoreML conversion requires coremltools. Install it or skip CoreML stages.")
+        sys.exit(1)
+
     out_path = os.path.join(output_dir, "language_model_single.mlpackage")
 
     wrapper = _LanguageModelWrapper(model.t3)
@@ -1477,6 +1509,10 @@ def convert_prefill(model, output_dir, validate=False, reference_dir=None,
                      quantize: str = "none"):
     """Convert the T3 prefill module to T3Prefill.mlpackage."""
     print("\n=== Converting T3Prefill.mlpackage ===")
+    if ct is None:
+        print("ERROR: CoreML conversion requires coremltools. Install it or skip CoreML stages.")
+        sys.exit(1)
+
     out_path = os.path.join(output_dir, "T3Prefill.mlpackage")
 
     wrapper = _T3PrefillWrapper(model.t3)
@@ -2159,6 +2195,9 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
             f"--torch29 mode needs torch>=2.9 (have {torch.__version__}). "
             f"Use .venv-torch29 with `pip install -r requirements-torch29.txt`."
         )
+    if ct is None and mode != "legacy":
+        print("WARNING: coremltools not available. Some CoreML-dependent optimizations may be skipped.")
+
 
     print(f"\n=== Converting conditional_decoder_single.onnx (mode={mode}) ===")
     onnx_dir = os.path.join(output_dir, "onnx")
@@ -2364,10 +2403,9 @@ def _optimize_onnx_graph(onnx_path: str, model_type: str = "bert",
     and ORT's L2 optimizations. Saves the optimized graph back over the
     input path (with external data file).
 
-    Falls back to ORT-only optimizations (no Python fusions) on error —
-    the transformers-package model_type-specific fusion paths have known
-    bugs against non-canonical graph shapes (e.g. onnx_model_gpt2.py
-    postprocess crashes when the expected reshape-after-gemm isn't found).
+    Uses the Windows-compatible transformers.base optimization path by
+    default (model_type="bert"). Falls back to ORT-only optimizations
+    (no Python fusions) on error.
     """
     from onnxruntime.transformers import optimizer
 
@@ -2816,11 +2854,11 @@ def main():
         "--optimize-graph",
         action="store_true",
         help=(
-            "Run onnxruntime.transformers.optimizer on each exported .onnx: "
-            "operator fusion (LayerNorm, GELU, attention), constant folding, "
-            "and ORT's L2 graph passes. Typically 5-15%% throughput on iOS "
-            "at no quality cost. Output is saved back over the same .onnx "
-            "path. CoreML stages ignore this flag."
+            "Run onnxruntime.transformers.optimizer (Windows base path) on "
+            "each exported .onnx: operator fusion (LayerNorm, GELU, attention), "
+            "constant folding, and ORT's L2 graph passes. Typically 5-15%% "
+            "throughput gain at no quality cost. Output is saved back over the "
+            "same .onnx path. CoreML stages ignore this flag."
         ),
     )
     parser.add_argument(
@@ -2834,6 +2872,17 @@ def main():
             "2-3x faster decode on iOS. Quality cost depends on the "
             "artifact — validate after. CoreML stages ignore this flag "
             "(CoreML palettization is a separate path; not yet wired)."
+        ),
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional local path to a Chatterbox model directory containing "
+            "safetensors weights. If provided, loads the model from this local "
+            "path instead of downloading from HuggingFace. Useful for offline "
+            "conversion or when you already have the model cached locally."
         ),
     )
     args = parser.parse_args()

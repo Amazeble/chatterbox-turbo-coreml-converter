@@ -1,14 +1,14 @@
+*.pyc
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-.venv-*/
-venv/
+*.log
+*.tmp
+*.swp
 .env
-
-# Conversion output
-out/
-*.mlpackage/
-*.mlmodelc/
-*.safetensors
-*.npy
+.env.local
+.vscode/
+.idea/
+dist/
+build/
+.coverage
+htmlcov/
+coverage/
