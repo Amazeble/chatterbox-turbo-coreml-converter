@@ -51,7 +51,7 @@ GPT2_MAX_POS = 8196
 GPT2_HEAD_DIM = GPT2_HIDDEN // GPT2_HEADS  # 64
 
 # Text vocab size for GPT-2 tokenizer (not the speech vocab)
-TEXT_VOCAB_SIZE = 50276
+TEXT_VOCAB_SIZE = 52260
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +407,7 @@ def convert_t3(model, output_dir, validate=False):
     np.save(os.path.join(output_dir, "speech_emb.npy"), speech_emb_weights.numpy())
     print(f"    speech_emb: {speech_emb_weights.shape}")
 
-    text_emb_weights = t3_model.t3.text_emb.weight.data.cpu().float()  # (50276, 1024)
+    text_emb_weights = t3_model.t3.text_emb.weight.data.cpu().float()  # (52260, 1024)
     np.save(os.path.join(output_dir, "text_emb.npy"), text_emb_weights.numpy())
     print(f"    text_emb: {text_emb_weights.shape}")
 
@@ -1412,7 +1412,7 @@ class _T3PrefillWrapper(nn.Module):
 
     def __init__(self, t3):
         super().__init__()
-        self.text_emb = t3.text_emb            # Embedding(50276, 1024)
+        self.text_emb = t3.text_emb            # Embedding(52260, 1024)
         self.speech_emb = t3.speech_emb        # Embedding(6563, 1024)
         self.spkr_enc = t3.cond_enc.spkr_enc   # Linear(256, 1024)
         self.wpe = t3.tfmr.wpe                 # Embedding(8196, 1024)
@@ -1491,7 +1491,7 @@ class _T3PrefillWrapper(nn.Module):
 def _make_fixture_prefill(seed=0, t_text=3, t_cond=375, t_speech=1):
     """Deterministic fixture matching MIL defaults (text=3, cond=375, speech=1)."""
     rng = _seeded_rng(seed)
-    text_tokens = rng.integers(0, 50000, size=(1, t_text), dtype=np.int32)
+    text_tokens = rng.integers(0, TEXT_VOCAB_SIZE, size=(1, t_text), dtype=np.int32)
     cond_speech_tokens = rng.integers(0, SPEECH_VOCAB_SIZE - 2, size=(1, t_cond), dtype=np.int32)
     speaker_emb = rng.standard_normal((1, SPEAKER_EMB_DIM), dtype=np.float32) * 0.5
     speech_tokens = np.array([[SPEECH_START_TOKEN]], dtype=np.int32)
