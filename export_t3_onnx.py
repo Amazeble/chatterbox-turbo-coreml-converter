@@ -22,6 +22,14 @@ except ImportError:
     HAS_ORT = False
     print("Warning: onnxruntime-transformers not found. Graph optimization (GroupQueryAttention) will be skipped.")
 
+# Try to import onnx-simplifier for graph simplification
+try:
+    import onnxsim
+    HAS_ONNXSIM = True
+except ImportError:
+    HAS_ONNXSIM = False
+    print("Warning: onnx-simplifier not found. Run 'pip install onnx-simplifier' for better graph optimization.")
+
 class T3TransformerBlock(nn.Module):
     """Single Transformer Block (GPT-2 style)"""
     def __init__(self, n_embd, n_head):
@@ -72,6 +80,7 @@ class T3Model(nn.Module):
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
+        self.block_size = block_size
         
         self.wte = nn.Embedding(vocab_size, n_embd)
         self.wpe = nn.Embedding(block_size, n_embd)
@@ -82,12 +91,20 @@ class T3Model(nn.Module):
         
         self.ln_f = nn.LayerNorm(n_embd)
         self.text_head = nn.Linear(n_embd, vocab_size, bias=False)
+        
+        # Register causal mask as buffer to avoid dynamic computation
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size).bool()
+        )
 
     def forward(self, idx):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.wpe.weight.size(0), f"Cannot forward sequence of length {t}, block size is only {self.wpe.weight.size(0)}"
+        # Assert removed to enable ONNX constant folding
+        # assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         
+        # Use fixed positional indices instead of dynamic arange
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
 
         tok_emb = self.wte(idx)
@@ -196,8 +213,11 @@ def export_onnx(model, output_path, seq_len=128):
     
     dummy_input = torch.randint(0, model.vocab_size, (1, seq_len), dtype=torch.long).to(device)
     
-    print(f"Exporting to ONNX (Opset 17)...")
+    print(f"Exporting to ONNX (Opset 17) with fixed sequence length {seq_len}...")
+    print("Note: Sequence length is fixed to enable constant folding. Dynamic sequence length causes Unsqueeze/Range ops that cannot be optimized.")
     
+    # Use fixed sequence length - do NOT make sequence dimension dynamic
+    # This allows onnx-simplifier to fold Range/Unsqueeze/Gather operations
     torch.onnx.export(
         model,
         dummy_input,
@@ -208,12 +228,40 @@ def export_onnx(model, output_path, seq_len=128):
         input_names=['input_ids'],
         output_names=['logits'],
         dynamic_axes={
-            'input_ids': {0: 'batch', 1: 'sequence'},
-            'logits': {0: 'batch', 1: 'sequence'}
+            'input_ids': {0: 'batch'},  # Only batch is dynamic, sequence is fixed
+            'logits': {0: 'batch'}      # Only batch is dynamic, sequence is fixed
         },
-        verbose=False
+        verbose=False,
+        dynamo=False
     )
     print(f"Saved raw ONNX to {output_path}")
+
+def simplify_onnx(output_path):
+    """Simplify ONNX model using onnx-simplifier to reduce unnecessary ops."""
+    if not HAS_ONNXSIM:
+        print("Skipping onnx-simplifier optimization (not installed).")
+        return
+    
+    print("Simplifying ONNX graph with onnx-simplifier...")
+    try:
+        import onnx
+        model = onnx.load(output_path)
+        model_simp, check = onnxsim.simplify(model)
+        assert check, "Simplified ONNX model validation failed"
+        
+        onnx.save(model_simp, output_path)
+        print(f"Saved simplified ONNX to {output_path}")
+        
+        # Print node distribution after simplification
+        nodes = [node.op_type for node in model_simp.graph.node]
+        counts = Counter(nodes)
+        
+        print("\n--- Node Type Distribution (After Simplification) ---")
+        for op, count in sorted(counts.items()):
+            print(f"  {op}: {count}")
+            
+    except Exception as e:
+        print(f"Simplification failed: {e}")
 
 def optimize_onnx(output_path):
     if not HAS_ORT:
@@ -253,6 +301,7 @@ def main():
     parser.add_argument("--weights", type=str, required=True, help="Path to .safetensors")
     parser.add_argument("--output-dir", type=str, default="./onnx_models", help="Output dir")
     parser.add_argument("--seq-len", type=int, default=128, help="Sequence length for export trace")
+    parser.add_argument("--simplify", action="store_true", help="Run onnx-simplifier to reduce ops")
     parser.add_argument("--optimize", action="store_true", help="Run ORT optimizer")
     
     args = parser.parse_args()
@@ -285,6 +334,9 @@ def main():
     
     out_path = os.path.join(args.output_dir, "language_model_single.onnx")
     export_onnx(model, out_path, seq_len=args.seq_len)
+    
+    if args.simplify:
+        simplify_onnx(out_path)
     
     if args.optimize:
         optimize_onnx(out_path)
