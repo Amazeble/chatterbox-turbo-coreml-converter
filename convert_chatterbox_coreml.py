@@ -385,13 +385,13 @@ class T3StatefulWrapper(nn.Module):
         self.register_buffer("keyCache", torch.zeros(context_size, feature_size, dtype=torch.float16))
         self.register_buffer("valueCache", torch.zeros(context_size, feature_size, dtype=torch.float16))
 
-    def forward(self, inputs_embeds, position_ids, cache_position, attention_mask):
+    def forward(self, inputs_embeds, position_ids, attention_mask, cache_position):
         """
         Args:
             inputs_embeds:  (1, 1, 1024) float — pre-computed embedding from Swift
             position_ids:   (1, 1) int32 — GPT-2 wpe position
-            cache_position: (1,) int32 — KV cache write position
             attention_mask: (1, 1, 1, 2048) float — 0 valid, -1e9 unfilled
+            cache_position: (1,) int32 — current cache position index (kept for signature compatibility)
 
         Returns:
             logits: (1, vocab_size) float16 — logits for next token
@@ -403,12 +403,13 @@ class T3StatefulWrapper(nn.Module):
         # Store mask on cache for patched attention to read
         cache.kv_mask = attention_mask
 
+        # Do NOT pass cache_position to GPT2Model.forward() as it doesn't accept this argument
+        # Position is handled via position_ids which is passed explicitly
         outputs = self.tfmr(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             past_key_values=cache,
             use_cache=True,
-            cache_position=cache_position,
         )
         hidden = outputs.last_hidden_state
 
@@ -456,13 +457,13 @@ def convert_t3(model, output_dir, validate=False):
     # Trace with float embedding input + attention mask
     example_embeds = torch.randn(1, 1, GPT2_HIDDEN)
     example_pos = torch.zeros(1, 1, dtype=torch.int32)
-    example_cache_pos = torch.zeros(1, dtype=torch.int32)
     example_mask = torch.zeros(1, 1, 1, CONTEXT_SIZE, dtype=torch.float32)
     example_mask[:, :, :, 1:] = -1e9  # only position 0 valid in example
+    example_cache_pos = torch.zeros(1, dtype=torch.int32)
 
     print("  Tracing T3Stateful (inputs_embeds + mask)...")
     with torch.no_grad():
-        traced = torch.jit.trace(wrapper, (example_embeds, example_pos, example_cache_pos, example_mask))
+        traced = torch.jit.trace(wrapper, (example_embeds, example_pos, example_mask, example_cache_pos))
 
     # Restore original forward
     GPT2Attention.forward = original_forward
@@ -491,8 +492,8 @@ def convert_t3(model, output_dir, validate=False):
         inputs=[
             ct.TensorType(name="inputs_embeds", shape=(1, 1, GPT2_HIDDEN), dtype=np.float32),
             ct.TensorType(name="position_ids", shape=(1, 1), dtype=np.int32),
-            ct.TensorType(name="cache_position", shape=(1,), dtype=np.int32),
             ct.TensorType(name="attention_mask", shape=(1, 1, 1, CONTEXT_SIZE), dtype=np.float32),
+            ct.TensorType(name="cache_position", shape=(1,), dtype=np.int32),
         ],
         outputs=[ct.TensorType(name="logits", dtype=np.float16)],
         states=states,
@@ -554,17 +555,15 @@ def validate_t3_stateful(pytorch_model, model_path):
     t0 = time.time()
     # Position 0: conditioning
     ml_model.predict(
-        {"inputs_embeds": cond_emb, "position_ids": np.array([[0]], dtype=np.int32),
-         "cache_position": np.array([0], dtype=np.int32)},
+        {"inputs_embeds": cond_emb, "position_ids": np.array([[0]], dtype=np.int32), "cache_position": np.array([0], dtype=np.int32)},
         state=state,
     )
     # Positions 1-16: speech tokens
     for i in range(16):
         emb = speech_emb_table[prefill_ids[i]].reshape(1, 1, GPT2_HIDDEN).astype(np.float32)
         pos = np.array([[i + 1]], dtype=np.int32)
-        cp = np.array([i + 1], dtype=np.int32)
         ml_model.predict(
-            {"inputs_embeds": emb, "position_ids": pos, "cache_position": cp},
+            {"inputs_embeds": emb, "position_ids": pos, "cache_position": np.array([i + 1], dtype=np.int32)},
             state=state,
         )
     prefill_ms = (time.time() - t0) * 1000
@@ -573,15 +572,13 @@ def validate_t3_stateful(pytorch_model, model_path):
     # Decode step 1
     decode_emb = speech_emb_table[42].reshape(1, 1, GPT2_HIDDEN).astype(np.float32)
     cm_d1 = ml_model.predict(
-        {"inputs_embeds": decode_emb, "position_ids": np.array([[17]], dtype=np.int32),
-         "cache_position": np.array([17], dtype=np.int32)},
+        {"inputs_embeds": decode_emb, "position_ids": np.array([[17]], dtype=np.int32), "cache_position": np.array([17], dtype=np.int32)},
         state=state,
     )
 
     # Decode step 2
     cm_d2 = ml_model.predict(
-        {"inputs_embeds": decode_emb, "position_ids": np.array([[18]], dtype=np.int32),
-         "cache_position": np.array([18], dtype=np.int32)},
+        {"inputs_embeds": decode_emb, "position_ids": np.array([[18]], dtype=np.int32), "cache_position": np.array([18], dtype=np.int32)},
         state=state,
     )
 
