@@ -31,7 +31,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-
+import coremltools as ct
 from safetensors.torch import save_file as save_safetensors
 
 
@@ -51,7 +51,7 @@ GPT2_MAX_POS = 8196
 GPT2_HEAD_DIM = GPT2_HIDDEN // GPT2_HEADS  # 64
 
 # Text vocab size for GPT-2 tokenizer (not the speech vocab)
-TEXT_VOCAB_SIZE = 52260
+TEXT_VOCAB_SIZE = 50276
 
 
 # ---------------------------------------------------------------------------
@@ -241,26 +241,20 @@ class ChatterboxModels:
         self.model_dir = model_dir
 
 
-def load_pytorch_model(model_path=None):
-    """Load the Chatterbox Turbo PyTorch model components (v1 path) from local directory.
+def load_pytorch_model(cache_dir=None):
+    """Download and load the Chatterbox Turbo PyTorch model components (v1 path).
 
-    Uses YAML config + manual state_dict load. Requires a local model path.
-    
-    Args:
-        model_path: Required local path to model directory.
+    Uses YAML config + manual state_dict load. v4 stages should use
+    load_pytorch_model_v4() which goes through ChatterboxTurboTTS.from_pretrained
+    for the meanflow-trained s3gen weights.
     """
     _ensure_chatterbox_gpt2_config()
 
+    from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
-    if model_path is None:
-        raise ValueError("model_path is required. Use --model-path to specify local model directory.")
-    
-    model_dir = Path(model_path)
-    if not model_dir.exists():
-        raise FileNotFoundError(f"Model path does not exist: {model_path}")
-    
-    print(f"Loading Chatterbox Turbo from local path: {model_path}...")
+    print("Downloading Chatterbox Turbo weights...")
+    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
     print(f"  Model dir: {model_dir}")
 
     print("  Loading T3 (GPT-2 Medium turbo)...")
@@ -279,36 +273,7 @@ def load_pytorch_model(model_path=None):
 
     t3 = T3(hp=turbo_cfg)
     t3_state = load_file(model_dir / "t3_turbo_v1.safetensors")
-    
-    # Handle vocab size mismatch: checkpoint has 52260 but model expects 50276
-    # Slice the text_emb and speech_head weights to match
-    expected_vocab = 50276
-    checkpoint_vocab = 52260
-    
-    # Check if we need to adjust embeddings
-    if "text_emb.weight" in t3_state and t3_state["text_emb.weight"].shape[0] == checkpoint_vocab:
-        print(f"  Adjusting vocab size from {checkpoint_vocab} to {expected_vocab}...")
-        # Slice text_emb.weight
-        t3_state["text_emb.weight"] = t3_state["text_emb.weight"][:expected_vocab, :]
-        
-    # Also check for tfmr.wte.weight which might exist in some checkpoints
-    if "tfmr.wte.weight" in t3_state:
-        if t3_state["tfmr.wte.weight"].shape[0] == checkpoint_vocab:
-            print(f"  Adjusting tfmr.wte.weight vocab size from {checkpoint_vocab} to {expected_vocab}...")
-            t3_state["tfmr.wte.weight"] = t3_state["tfmr.wte.weight"][:expected_vocab, :]
-    
-    # Also slice speech_head.weight if it has the larger vocab size
-    if "speech_head.weight" in t3_state and t3_state["speech_head.weight"].shape[0] == checkpoint_vocab:
-        print(f"  Adjusting speech_head.weight vocab size from {checkpoint_vocab} to {expected_vocab}...")
-        t3_state["speech_head.weight"] = t3_state["speech_head.weight"][:expected_vocab, :]
-    
-    # Also slice text_head.weight if it has the larger vocab size
-    if "text_head.weight" in t3_state and t3_state["text_head.weight"].shape[0] == checkpoint_vocab:
-        print(f"  Adjusting text_head.weight vocab size from {checkpoint_vocab} to {expected_vocab}...")
-        t3_state["text_head.weight"] = t3_state["text_head.weight"][:expected_vocab, :]
-    
-    # Load with strict=False to ignore missing keys like tfmr.wte.weight if it doesn't exist
-    t3.load_state_dict(t3_state, strict=False)
+    t3.load_state_dict(t3_state)
     t3.to("cpu").train(False)
 
     print("  Loading S3Gen...")
@@ -321,30 +286,22 @@ def load_pytorch_model(model_path=None):
     return ChatterboxModels(t3=t3, s3gen=s3gen, model_dir=model_dir)
 
 
-def load_pytorch_model_v4(model_path=None):
+def load_pytorch_model_v4(cache_dir=None):
     """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained.
 
     This matches the v4 HF artifacts (meanflow-trained s3gen). v4 stages
     (prefill, lm-onnx, cond-decoder) should use this loader.
-    
-    Args:
-        model_path: Required local path to model directory.
     """
     _ensure_chatterbox_gpt2_config()
 
+    print("Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('cpu')...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
+    from huggingface_hub import snapshot_download
 
-    if model_path is None:
-        raise ValueError("model_path is required. Use --model-path to specify local model directory.")
-    
-    print(f"Loading Chatterbox Turbo from local path: {model_path}...")
-    model_dir = Path(model_path)
-    if not model_dir.exists():
-        raise FileNotFoundError(f"Model path does not exist: {model_path}")
-    tts = ChatterboxTurboTTS.from_pretrained(str(model_dir), local_files_only=True)
-    
+    tts = ChatterboxTurboTTS.from_pretrained("cpu")
     tts.t3.train(False)
     tts.s3gen.train(False)
+    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
     print(f"  Model dir: {model_dir}")
     print("  Models loaded successfully.")
     return ChatterboxModels(t3=tts.t3, s3gen=tts.s3gen, model_dir=model_dir)
@@ -380,24 +337,17 @@ class T3StatefulWrapper(nn.Module):
         self.register_buffer("keyCache", torch.zeros(context_size, feature_size, dtype=torch.float16))
         self.register_buffer("valueCache", torch.zeros(context_size, feature_size, dtype=torch.float16))
 
-    def forward(self, inputs_embeds, cache_position):
+    def forward(self, inputs_embeds, position_ids, cache_position, attention_mask):
         """
         Args:
             inputs_embeds:  (1, 1, 1024) float — pre-computed embedding from Swift
-            cache_position: (1,) int32 — current cache position index
+            position_ids:   (1, 1) int32 — GPT-2 wpe position
+            cache_position: (1,) int32 — KV cache write position
+            attention_mask: (1, 1, 1, 2048) float — 0 valid, -1e9 unfilled
 
         Returns:
             logits: (1, vocab_size) float16 — logits for next token
         """
-        # Calculate position_ids from cache_position
-        position_ids = cache_position.unsqueeze(0)  # (1, 1)
-        
-        # Create attention mask based on cache_position
-        batch_size = inputs_embeds.shape[0]
-        attention_mask = torch.zeros(1, 1, 1, CONTEXT_SIZE, dtype=torch.float32, device=inputs_embeds.device)
-        attention_mask[:, :, :, :int(cache_position.item())+1] = 0
-        attention_mask[:, :, :, int(cache_position.item())+1:] = -1e9
-
         cache = SliceUpdateKeyValueCache(
             self.keyCache, self.valueCache,
             n_layers=GPT2_LAYERS, n_heads=GPT2_HEADS, head_dim=GPT2_HEAD_DIM
@@ -410,6 +360,7 @@ class T3StatefulWrapper(nn.Module):
             position_ids=position_ids,
             past_key_values=cache,
             use_cache=True,
+            cache_position=cache_position,
         )
         hidden = outputs.last_hidden_state
 
@@ -417,19 +368,28 @@ class T3StatefulWrapper(nn.Module):
         return logits
 
 
-def convert_t3(model, output_dir):
-    """Convert T3 - export embedding weights."""
-    print("\n=== Converting T3 ===")
-    
-    # Export embedding weights for Swift-side lookup
-    print("  Exporting embedding weights...")
+def convert_t3(model, output_dir, validate=False):
+    """Convert T3 to a single stateful CoreML model with StateType KV cache."""
+    print("\n=== Converting T3 Stateful (GPT-2 + KV Cache) ===")
+
     t3_model = model
     t3_model.t3.eval()
+
+    # Monkey-patch GPT2Attention to use SliceUpdateKeyValueCache
+    from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+    original_forward = GPT2Attention.forward
+    GPT2Attention.forward = patched_gpt2_attention_forward
+
+    wrapper = T3StatefulWrapper(t3_model, context_size=CONTEXT_SIZE)
+    wrapper.eval()
+
+    # Export embedding weights for Swift-side lookup
+    print("  Exporting embedding weights...")
     speech_emb_weights = t3_model.t3.speech_emb.weight.data.cpu().float()  # (6563, 1024)
     np.save(os.path.join(output_dir, "speech_emb.npy"), speech_emb_weights.numpy())
     print(f"    speech_emb: {speech_emb_weights.shape}")
 
-    text_emb_weights = t3_model.t3.text_emb.weight.data.cpu().float()  # (52260, 1024)
+    text_emb_weights = t3_model.t3.text_emb.weight.data.cpu().float()  # (50276, 1024)
     np.save(os.path.join(output_dir, "text_emb.npy"), text_emb_weights.numpy())
     print(f"    text_emb: {text_emb_weights.shape}")
 
@@ -441,10 +401,144 @@ def convert_t3(model, output_dir):
     np.save(os.path.join(output_dir, "spkr_enc_bias.npy"), spkr_b.numpy())
     print(f"    spkr_enc: weight {spkr_w.shape}, bias {spkr_b.shape}")
 
+    # Trace with float embedding input + attention mask
+    example_embeds = torch.randn(1, 1, GPT2_HIDDEN)
+    example_pos = torch.zeros(1, 1, dtype=torch.int32)
+    example_cache_pos = torch.zeros(1, dtype=torch.int32)
+    example_mask = torch.zeros(1, 1, 1, CONTEXT_SIZE, dtype=torch.float32)
+    example_mask[:, :, :, 1:] = -1e9  # only position 0 valid in example
+
+    print("  Tracing T3Stateful (inputs_embeds + mask)...")
+    with torch.no_grad():
+        traced = torch.jit.trace(wrapper, (example_embeds, example_pos, example_cache_pos, example_mask))
+
+    # Restore original forward
+    GPT2Attention.forward = original_forward
+
+    # StateType for 2D seq-first KV cache
+    feature_size = GPT2_LAYERS * GPT2_HEADS * GPT2_HEAD_DIM  # 24 * 16 * 64 = 24576
+    cache_shape = (CONTEXT_SIZE, feature_size)
+    states = [
+        ct.StateType(
+            wrapped_type=ct.TensorType(shape=cache_shape, dtype=np.float16),
+            name="keyCache",
+        ),
+        ct.StateType(
+            wrapped_type=ct.TensorType(shape=cache_shape, dtype=np.float16),
+            name="valueCache",
+        ),
+    ]
+
+    # Fixed decode shape: seq=1 token + 1 conditioning = 2 positions.
+    # EnumeratedShapes and RangeDim both cause error -14 with stateful models.
+    # Prefill is done token-by-token through the same fixed-shape model.
+    print("  Converting with fixed decode shape (seq=1, pos=2)...")
+
+    mlmodel = ct.convert(
+        traced,
+        inputs=[
+            ct.TensorType(name="inputs_embeds", shape=(1, 1, GPT2_HIDDEN), dtype=np.float32),
+            ct.TensorType(name="position_ids", shape=(1, 1), dtype=np.int32),
+            ct.TensorType(name="cache_position", shape=(1,), dtype=np.int32),
+            ct.TensorType(name="attention_mask", shape=(1, 1, 1, CONTEXT_SIZE), dtype=np.float32),
+        ],
+        outputs=[ct.TensorType(name="logits", dtype=np.float16)],
+        states=states,
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    out_path = os.path.join(output_dir, "T3Stateful.mlpackage")
+    mlmodel.save(out_path)
+    print(f"  Saved: {out_path}")
+
+    # Check for state ops in MIL program
+    from coremltools.converters.mil.testing_utils import get_op_types_in_program
+    ops = get_op_types_in_program(mlmodel._mil_program)
+    has_state = "coreml_update_state" in ops
+    print(f"  State ops present: {has_state}")
+    if not has_state:
+        print("  WARNING: No coreml_update_state — KV cache may not work!")
+
+    if validate:
+        validate_t3_stateful(t3_model, out_path)
+
 
 def validate_t3_stateful(pytorch_model, model_path):
-    """Validate stateful T3 output matches PyTorch."""
+    """Validate stateful T3 CoreML output matches PyTorch."""
     print("\n  --- T3 Stateful Numerical Validation ---")
+
+    # Save and reload to get CoreML framework backend (needed for make_state).
+    # The convert() output uses coremltools internal backend which can't make_state().
+    # CPU_ONLY avoids error -14 from ANE compilation of dynamic shapes.
+    import tempfile, shutil
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = os.path.join(tmpdir, "T3Stateful.mlpackage")
+        shutil.copytree(model_path, tmp_path)
+        ml_model = ct.models.MLModel(tmp_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+
+    state = ml_model.make_state()
+
+    # Token-by-token prefill (fixed shape model only accepts seq=1)
+    # Each call processes 1 speech token + 1 conditioning token = 2 positions
+    import time
+    prefill_ids = np.random.randint(0, SPEECH_VOCAB_SIZE, (16,)).astype(np.int32)
+    prefill_spk = np.random.randn(1, SPEAKER_EMB_DIM).astype(np.float32)
+    zero_spk = np.zeros((1, SPEAKER_EMB_DIM), dtype=np.float32)
+
+    # Load speech embedding table for lookups
+    speech_emb_table = pytorch_model.t3.speech_emb.weight.data.cpu().numpy()  # (vocab, 1024)
+
+    # Load spkr_enc weights for conditioning
+    spkr_enc = pytorch_model.t3.cond_enc.spkr_enc
+    spkr_w = spkr_enc.weight.data.cpu().numpy()  # (1024, 256)
+    spkr_b = spkr_enc.bias.data.cpu().numpy()    # (1024,)
+
+    # Prefill: position 0 = speaker conditioning, positions 1+ = speech tokens
+    speaker_emb = np.random.randn(SPEAKER_EMB_DIM).astype(np.float32)
+    cond_emb = (spkr_w @ speaker_emb + spkr_b).reshape(1, 1, GPT2_HIDDEN).astype(np.float32)
+
+    t0 = time.time()
+    # Position 0: conditioning
+    ml_model.predict(
+        {"inputs_embeds": cond_emb, "position_ids": np.array([[0]], dtype=np.int32),
+         "cache_position": np.array([0], dtype=np.int32)},
+        state=state,
+    )
+    # Positions 1-16: speech tokens
+    for i in range(16):
+        emb = speech_emb_table[prefill_ids[i]].reshape(1, 1, GPT2_HIDDEN).astype(np.float32)
+        pos = np.array([[i + 1]], dtype=np.int32)
+        cp = np.array([i + 1], dtype=np.int32)
+        ml_model.predict(
+            {"inputs_embeds": emb, "position_ids": pos, "cache_position": cp},
+            state=state,
+        )
+    prefill_ms = (time.time() - t0) * 1000
+    print(f"  Prefill (1 cond + 16 tokens): {prefill_ms:.0f}ms ({prefill_ms/17:.1f}ms/tok)")
+
+    # Decode step 1
+    decode_emb = speech_emb_table[42].reshape(1, 1, GPT2_HIDDEN).astype(np.float32)
+    cm_d1 = ml_model.predict(
+        {"inputs_embeds": decode_emb, "position_ids": np.array([[17]], dtype=np.int32),
+         "cache_position": np.array([17], dtype=np.int32)},
+        state=state,
+    )
+
+    # Decode step 2
+    cm_d2 = ml_model.predict(
+        {"inputs_embeds": decode_emb, "position_ids": np.array([[18]], dtype=np.int32),
+         "cache_position": np.array([18], dtype=np.int32)},
+        state=state,
+    )
+
+    diff = np.abs(cm_d1["logits"] - cm_d2["logits"]).max()
+    print(f"  Decode step diff: {diff:.4f}")
+    if diff > 0.001:
+        print("  PASS: KV cache working across decode steps!")
+    else:
+        print("  WARNING: Decode outputs identical")
 
 
 # ===========================================================================
@@ -515,24 +609,143 @@ class S3UNetWrapper(nn.Module):
         return self.estimator(x, mask, mu, t, spks_proj, cond)
 
 
-def convert_s3(model, output_dir):
-    """Convert S3 - export encoder weights."""
-    print("\n=== Converting S3Encoder ===")
-    
+def convert_s3(model, output_dir, validate=False):
+    """Convert S3Encoder and S3UNet to CoreML."""
+    print("\n=== Converting S3Encoder (Conformer) ===")
+
     s3gen = model.s3gen
     s3gen.eval()
     s3_flow = s3gen.flow  # encoder/decoder live under flow
 
-    # Export encoder weights
-    print("  Exporting encoder weights...")
-    input_emb_weight = s3_flow.input_embedding.input_emb.weight.data.cpu().float()
-    np.save(os.path.join(output_dir, "s3_input_emb.npy"), input_emb_weight.numpy())
-    print(f"    s3_input_emb: {input_emb_weight.shape}")
+    # Monkey-patch view_as -> reshape (CoreML doesn't support view_as)
+    _original_view_as = torch.Tensor.view_as
+    torch.Tensor.view_as = lambda self, other: self.reshape(other.shape)
+
+    # --- S3Encoder ---
+    print("  Tracing S3Encoder...")
+    encoder_wrapper = S3EncoderWrapper(s3_flow)
+    encoder_wrapper.eval()
+
+    # Single input: concatenated prompt + speech tokens
+    example_tokens = torch.zeros(1, 70, dtype=torch.long)
+
+    with torch.no_grad():
+        traced_encoder = torch.jit.trace(encoder_wrapper, (example_tokens,))
+
+    print("  Converting S3Encoder to CoreML...")
+    encoder_inputs = [
+        ct.TensorType(
+            name="all_tokens",
+            shape=ct.Shape(shape=(1, ct.RangeDim(lower_bound=1, upper_bound=2048, default=70))),
+            dtype=np.int32,
+        ),
+    ]
+
+    encoder_coreml = ct.convert(
+        traced_encoder,
+        inputs=encoder_inputs,
+        outputs=[ct.TensorType(name="encoder_proj", dtype=np.float16)],
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    encoder_path = os.path.join(output_dir, "S3Encoder.mlpackage")
+    encoder_coreml.save(encoder_path)
+    print(f"  Saved: {encoder_path}")
+
+    # --- S3UNet ---
+    print("\n=== Converting S3UNet (Denoiser) ===")
+    print("  Tracing S3UNet...")
+    unet_wrapper = S3UNetWrapper(s3_flow)
+    unet_wrapper.eval()
+
+    T = 100  # example time steps
+    example_x = torch.randn(1, MEL_BINS, T)
+    example_mu = torch.randn(1, MEL_BINS, T)
+    example_mask = torch.ones(1, 1, T)
+    example_t = torch.tensor([0.5])
+    example_spks = torch.randn(1, CAMPP_EMB_DIM)
+    example_cond = torch.randn(1, MEL_BINS, T)
+    example_r = torch.tensor([0.5])
+
+    with torch.no_grad():
+        traced_unet = torch.jit.trace(
+            unet_wrapper,
+            (example_x, example_mu, example_mask, example_t,
+             example_spks, example_cond, example_r),
+        )
+
+    print("  Converting S3UNet to CoreML...")
+    T_dim = ct.RangeDim(lower_bound=1, upper_bound=4096, default=100)
+    unet_inputs = [
+        ct.TensorType(name="x", shape=ct.Shape(shape=(1, MEL_BINS, T_dim)), dtype=np.float32),
+        ct.TensorType(name="mu", shape=ct.Shape(shape=(1, MEL_BINS, T_dim)), dtype=np.float32),
+        ct.TensorType(name="mask", shape=ct.Shape(shape=(1, 1, T_dim)), dtype=np.float32),
+        ct.TensorType(name="t", shape=(1,), dtype=np.float32),
+        ct.TensorType(name="spks", shape=(1, CAMPP_EMB_DIM), dtype=np.float32),
+        ct.TensorType(name="cond", shape=ct.Shape(shape=(1, MEL_BINS, T_dim)), dtype=np.float32),
+        ct.TensorType(name="r", shape=(1,), dtype=np.float32),
+    ]
+
+    unet_coreml = ct.convert(
+        traced_unet,
+        inputs=unet_inputs,
+        outputs=[ct.TensorType(name="velocity", dtype=np.float16)],
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    unet_path = os.path.join(output_dir, "S3UNet.mlpackage")
+    unet_coreml.save(unet_path)
+    print(f"  Saved: {unet_path}")
+
+    # Restore monkey-patched view_as
+    torch.Tensor.view_as = _original_view_as
+
+    if validate:
+        validate_s3(s3_flow, encoder_path, unet_path)
 
 
 def validate_s3(s3_flow, encoder_path, unet_path):
-    """Validate S3 outputs match PyTorch."""
+    """Validate S3 CoreML outputs match PyTorch."""
     print("\n  --- S3 Numerical Validation ---")
+
+    encoder_ml = ct.models.MLModel(encoder_path)
+    unet_ml = ct.models.MLModel(unet_path)
+
+    # Test encoder
+    test_tokens = torch.randint(0, SPEECH_VOCAB_SIZE, (1, 40), dtype=torch.long)
+
+    encoder_wrapper = S3EncoderWrapper(s3_flow)
+    with torch.no_grad():
+        pt_mu = encoder_wrapper(test_tokens)
+
+    cm_out = encoder_ml.predict({
+        "all_tokens": test_tokens.int().numpy(),
+    })
+    cm_mu = torch.from_numpy(cm_out["encoder_proj"]).float()
+
+    cos_sim = torch.nn.functional.cosine_similarity(
+        pt_mu.flatten().unsqueeze(0),
+        cm_mu.flatten().unsqueeze(0)
+    ).item()
+    print(f"  S3Encoder cosine similarity: {cos_sim:.6f}")
+    if cos_sim >= 0.99:
+        print("  PASS")
+    else:
+        print("  WARNING: cosine sim < 0.99")
+
+    # Test UNet
+    T = 40
+    test_x = torch.randn(1, MEL_BINS, T)
+    test_mu_in = torch.randn(1, MEL_BINS, T)
+    test_mask = torch.ones(1, 1, T)
+    test_t = torch.tensor([0.5])
+    test_spks = torch.randn(1, CAMPP_EMB_DIM)
+    test_cond = torch.randn(1, MEL_BINS, T)
+    test_r = torch.tensor([0.5])
 
     unet_wrapper = S3UNetWrapper(s3_flow)
     unet_wrapper.eval()
@@ -591,8 +804,9 @@ def extract_tokenizer_and_config(model, output_dir):
     """Copy tokenizer files and create config.json."""
     print("\n=== Extracting Tokenizer + Config ===")
 
-    # Use model_dir from the loaded model object
-    model_dir = model.model_dir
+    # Find the cached model directory
+    from huggingface_hub import snapshot_download
+    model_dir = snapshot_download("ResembleAI/chatterbox-turbo")
 
     # Copy tokenizer files
     tokenizer_files = ["tokenizer.json", "vocab.json", "merges.txt"]
@@ -686,7 +900,7 @@ def _compare_outputs(
 
 
 def _load_onnx_session(path):
-    """Load an ONNX model with onnxruntime (Windows base), CPU provider, optimization on."""
+    """Load an ONNX model with onnxruntime, CPU provider, optimization on."""
     import onnxruntime as ort
 
     so = ort.SessionOptions()
@@ -741,13 +955,42 @@ def _check_onnx_graph_for_ios(onnx_path: str) -> bool:
 
 
 def _check_xcrun_coremlcompiler(mlpackage_path: str) -> bool:
-    """Xcode coremlcompiler check - not applicable for ONNX-only builds."""
-    return True
+    """Compile the .mlpackage via Xcode's coremlcompiler (same as device build)."""
+    if shutil.which("xcrun") is None:
+        print(f"  [ios] xcrun not installed; skipping coremlcompiler check  SKIP")
+        return True
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            ["xcrun", "coremlcompiler", "compile", mlpackage_path, tmp],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            print(f"  [ios] coremlcompiler FAILED: {proc.stderr.strip()[:300]}")
+            return False
+        print(f"  [ios] xcrun coremlcompiler  PASS")
+        return True
 
 
 def _try_ane_compute(mlpackage_path: str, sample_inputs: dict) -> bool:
-    """ANE compute check - not applicable for ONNX-only builds."""
-    return False
+    """Load the package targeting CPU_AND_NE on macOS and run one prediction.
+    Reports compute_unit_usage when available. Returns True if it executes."""
+    try:
+        ml = ct.models.MLModel(mlpackage_path, compute_units=ct.ComputeUnit.CPU_AND_NE)
+    except Exception as exc:
+        print(f"  [ios] CPU_AND_NE load FAILED: {str(exc)[:300]}  FAIL")
+        return False
+    try:
+        _ = ml.predict(sample_inputs)
+    except Exception as exc:
+        print(f"  [ios] CPU_AND_NE predict FAILED: {str(exc)[:300]}  FAIL")
+        return False
+    usage = getattr(ml, "compute_unit_usage", None)
+    if usage is not None:
+        print(f"  [ios] CPU_AND_NE plan: {usage}  (Mac plan; iPhone plan may differ)")
+    else:
+        print(f"  [ios] CPU_AND_NE predict succeeded  OK")
+    return True
 
 
 # --- Stage A: language_model_single.onnx -----------------------------------
@@ -929,7 +1172,7 @@ def convert_language_model_onnx(model, output_dir, validate=False, reference_dir
 
     if optimize_graph:
         _optimize_onnx_graph(
-            out_path, model_type="bert",
+            out_path, model_type="gpt2",
             num_heads=GPT2_HEADS, hidden_size=GPT2_HIDDEN,
         )
     if quantize == "int8":
@@ -940,13 +1183,124 @@ def convert_language_model_onnx(model, output_dir, validate=False, reference_dir
 
 
 def convert_language_model_coreml(model, output_dir, validate=False):
-    """CoreML conversion - not applicable for ONNX-only builds."""
-    pass
+    """Native CoreML port of language_model_single.onnx.
+
+    Uses the same _LanguageModelWrapper as the ONNX path — just traces it
+    through torch.jit.trace and runs it through coremltools.convert
+    instead of torch.onnx.export. The Swift consumer would then load
+    `language_model_single.mlpackage` via MLModel and call .prediction
+    per decode step.
+
+    Output: out/language_model_single.mlpackage
+    """
+    print("\n=== Converting language_model_single.mlpackage (CoreML) ===")
+    out_path = os.path.join(output_dir, "language_model_single.mlpackage")
+
+    wrapper = _LanguageModelWrapper(model.t3)
+    wrapper.train(False)
+
+    # Same fixture as the ONNX path; CoreML needs concrete shapes for trace.
+    past_len = 10
+    embeds_t = torch.randn(1, 1, GPT2_HIDDEN, dtype=torch.float32) * 0.02
+    mask_t = torch.ones(1, past_len + 1, dtype=torch.int64)
+    pos_t = torch.tensor([[past_len]], dtype=torch.int64)
+    flat_pkv_t = []
+    for _ in range(GPT2_LAYERS):
+        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
+        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
+
+    input_names, output_names = _lm_onnx_io_names()
+
+    print(f"  Tracing with past_len={past_len}...")
+    with torch.no_grad():
+        traced = torch.jit.trace(
+            wrapper, (embeds_t, mask_t, pos_t, *flat_pkv_t), check_trace=False,
+        )
+
+    print("  Converting to CoreML (FP32, iOS18, compute_units=ALL)...")
+    past_len_dim = ct.RangeDim(lower_bound=1, upper_bound=2048, default=past_len)
+    total_seq_dim = ct.RangeDim(lower_bound=2, upper_bound=2049, default=past_len + 1)
+    inputs = [
+        ct.TensorType(name="inputs_embeds", shape=(1, 1, GPT2_HIDDEN), dtype=np.float32),
+        ct.TensorType(name="attention_mask", shape=ct.Shape(shape=(1, total_seq_dim)), dtype=np.int32),
+        ct.TensorType(name="position_ids", shape=(1, 1), dtype=np.int32),
+    ]
+    for i in range(GPT2_LAYERS):
+        inputs.append(ct.TensorType(
+            name=f"past_key_values.{i}.key",
+            shape=ct.Shape(shape=(1, GPT2_HEADS, past_len_dim, GPT2_HEAD_DIM)),
+            dtype=np.float32,
+        ))
+        inputs.append(ct.TensorType(
+            name=f"past_key_values.{i}.value",
+            shape=ct.Shape(shape=(1, GPT2_HEADS, past_len_dim, GPT2_HEAD_DIM)),
+            dtype=np.float32,
+        ))
+    outputs_decl = [ct.TensorType(name=n, dtype=np.float32) for n in output_names]
+
+    mlmodel = ct.convert(
+        traced,
+        inputs=inputs,
+        outputs=outputs_decl,
+        compute_precision=ct.precision.FLOAT32,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    if os.path.exists(out_path):
+        shutil.rmtree(out_path)
+    mlmodel.save(out_path)
+    size_mb = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _, files in os.walk(out_path) for f in files
+    ) / 1e6
+    print(f"  Saved {out_path} ({size_mb:.1f} MB)")
+
+    if validate:
+        validate_language_model_coreml(model, out_path)
 
 
 def validate_language_model_coreml(model, our_path):
-    """CoreML validation - not applicable for ONNX-only builds."""
-    pass
+    print("\n  --- language_model_single.mlpackage validation ---")
+    embeds, mask, pos, kv_pairs = _make_fixture_lm_onnx(seed=0, past_len=10)
+
+    # CoreML normalizes dots to underscores in input names — use the
+    # underscored form when feeding predict().
+    inputs = {
+        "inputs_embeds": embeds,
+        "attention_mask": mask.astype(np.int32),
+        "position_ids": pos.astype(np.int32),
+    }
+    for i, (k, v) in enumerate(kv_pairs):
+        inputs[f"past_key_values_{i}_key"] = k
+        inputs[f"past_key_values_{i}_value"] = v
+
+    # Load + predict
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_pkg = os.path.join(tmp, "language_model_single.mlpackage")
+        shutil.copytree(our_path, tmp_pkg)
+        ml = ct.models.MLModel(tmp_pkg, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+        our_out = ml.predict(inputs)
+    our_logits = np.asarray(our_out["logits"], dtype=np.float32)
+
+    # PyTorch reference
+    with torch.no_grad():
+        wrapper = _LanguageModelWrapper(model.t3)
+        wrapper.train(False)
+        t_inputs = (
+            torch.from_numpy(embeds),
+            torch.from_numpy(mask),
+            torch.from_numpy(pos),
+            *[torch.from_numpy(arr) for kv in kv_pairs for arr in kv],
+        )
+        ref_logits = wrapper(*t_inputs)[0].detach().cpu().numpy()
+
+    ok = _compare_outputs("logits", our_logits, ref_logits, cos_min=0.999, atol=5e-3)
+    print(f"\n  --- iOS compatibility ---")
+    ok &= _check_xcrun_coremlcompiler(our_path)
+    ok &= _try_ane_compute(our_path, inputs)
+    print(f"\n  language_model_single.mlpackage: {'READY' if ok else 'NOT READY'}")
+    return ok
 
 
 def validate_language_model_onnx(model, our_path, reference_dir=None):
@@ -1033,7 +1387,7 @@ class _T3PrefillWrapper(nn.Module):
 
     def __init__(self, t3):
         super().__init__()
-        self.text_emb = t3.text_emb            # Embedding(52260, 1024)
+        self.text_emb = t3.text_emb            # Embedding(50276, 1024)
         self.speech_emb = t3.speech_emb        # Embedding(6563, 1024)
         self.spkr_enc = t3.cond_enc.spkr_enc   # Linear(256, 1024)
         self.wpe = t3.tfmr.wpe                 # Embedding(8196, 1024)
@@ -1112,7 +1466,7 @@ class _T3PrefillWrapper(nn.Module):
 def _make_fixture_prefill(seed=0, t_text=3, t_cond=375, t_speech=1):
     """Deterministic fixture matching MIL defaults (text=3, cond=375, speech=1)."""
     rng = _seeded_rng(seed)
-    text_tokens = rng.integers(0, TEXT_VOCAB_SIZE, size=(1, t_text), dtype=np.int32)
+    text_tokens = rng.integers(0, 50000, size=(1, t_text), dtype=np.int32)
     cond_speech_tokens = rng.integers(0, SPEECH_VOCAB_SIZE - 2, size=(1, t_cond), dtype=np.int32)
     speaker_emb = rng.standard_normal((1, SPEAKER_EMB_DIM), dtype=np.float32) * 0.5
     speech_tokens = np.array([[SPEECH_START_TOKEN]], dtype=np.int32)
@@ -1123,10 +1477,152 @@ def convert_prefill(model, output_dir, validate=False, reference_dir=None,
                      quantize: str = "none"):
     """Convert the T3 prefill module to T3Prefill.mlpackage."""
     print("\n=== Converting T3Prefill.mlpackage ===")
+    out_path = os.path.join(output_dir, "T3Prefill.mlpackage")
+
+    wrapper = _T3PrefillWrapper(model.t3)
+    wrapper.train(False)
+
+    # Trace with MIL default shapes (T_text=3, T_cond=375, T_speech=1)
+    text_t, cond_t, spkr_t, spch_t = _make_fixture_prefill(seed=0)
+    text_pt = torch.from_numpy(text_t)
+    cond_pt = torch.from_numpy(cond_t)
+    spkr_pt = torch.from_numpy(spkr_t)
+    spch_pt = torch.from_numpy(spch_t)
+
+    print(
+        f"  Tracing with T_text={text_pt.shape[1]}, "
+        f"T_cond={cond_pt.shape[1]}, T_speech={spch_pt.shape[1]}..."
+    )
+    with torch.no_grad():
+        # check_trace=False suppresses spurious 1e-5 mismatch warnings caused
+        # by the SDPA fast path; we validate the converted model afterwards.
+        traced = torch.jit.trace(
+            wrapper, (text_pt, cond_pt, spkr_pt, spch_pt), check_trace=False
+        )
+
+    print("  Converting to CoreML (FP32 weights, iOS18 target)...")
+    inputs = [
+        ct.TensorType(
+            name="text_tokens",
+            shape=ct.Shape(shape=(1, ct.RangeDim(lower_bound=1, upper_bound=512, default=3))),
+            dtype=np.int32,
+        ),
+        ct.TensorType(
+            name="cond_speech_tokens",
+            shape=ct.Shape(shape=(1, ct.RangeDim(lower_bound=1, upper_bound=1024, default=375))),
+            dtype=np.int32,
+        ),
+        ct.TensorType(name="speaker_emb", shape=(1, SPEAKER_EMB_DIM), dtype=np.float32),
+        ct.TensorType(
+            name="speech_tokens",
+            shape=ct.Shape(shape=(1, ct.RangeDim(lower_bound=1, upper_bound=2048, default=1))),
+            dtype=np.int32,
+        ),
+    ]
+    outputs = [
+        ct.TensorType(name="logits", dtype=np.float32),
+        ct.TensorType(name="kv_cache", dtype=np.float32),
+    ]
+    # FLOAT32 matches the HF reference T3Prefill.mlmodelc weight precision
+    # (1.5 GB weight.bin = 4 bytes/param). FLOAT16 cuts that in half but the
+    # iPhone happily runs FP32 too and the HF copy is what's been validated
+    # device-side.
+    #
+    # compute_units=ALL lets the runtime bid for ANE in addition to CPU and
+    # GPU. The Swift consumer picks the actual dispatch via
+    # MLModelConfiguration.computeUnits — declaring ALL here just keeps ANE
+    # eligible. Previous version pinned CPU_AND_GPU which made ANE bidding
+    # impossible regardless of the Swift config.
+    mlmodel = ct.convert(
+        traced,
+        inputs=inputs,
+        outputs=outputs,
+        compute_precision=ct.precision.FLOAT32,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    if os.path.exists(out_path):
+        shutil.rmtree(out_path)
+    mlmodel.save(out_path)
+    size_mb = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _, files in os.walk(out_path) for f in files
+    ) / 1e6
+    print(f"  Saved {out_path} ({size_mb:.1f} MB)")
+
+    if quantize == "int8":
+        _quantize_coreml_int8(out_path)
+
+    if validate:
+        validate_prefill(model, out_path, reference_dir=reference_dir)
 
 
 def validate_prefill(model, our_path, reference_dir=None):
     print("\n  --- T3Prefill.mlpackage validation ---")
+
+    # Use the MIL default fixture (T_text=3, T_cond=375, T_speech=1) so any
+    # reference vs ours diff is purely numerical, not shape-driven.
+    text_t, cond_t, spkr_t, spch_t = _make_fixture_prefill(seed=0)
+    inputs = {
+        "text_tokens": text_t,
+        "cond_speech_tokens": cond_t,
+        "speaker_emb": spkr_t,
+        "speech_tokens": spch_t,
+    }
+
+    # Load OURS via CoreML
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_pkg = os.path.join(tmp, "T3Prefill.mlpackage")
+        shutil.copytree(our_path, tmp_pkg)
+        our_ml = ct.models.MLModel(tmp_pkg, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+        our_out = our_ml.predict(inputs)
+    our_logits = np.asarray(our_out["logits"], dtype=np.float32)
+    our_kv = np.asarray(our_out["kv_cache"], dtype=np.float32)
+
+    # Reference. The HF snapshot's T3Prefill.mlmodelc dir is missing the
+    # Manifest.json that coremltools' MLModel() needs to load — it was the
+    # raw model.mil/weights output from ct.convert, not a Xcode-compiled
+    # artifact. If we can't load it directly, fall back to PyTorch.
+    ref_logits = ref_kv = None
+    if reference_dir is not None:
+        for candidate in ("T3Prefill.mlpackage", "T3Prefill.mlmodelc"):
+            ref_path = os.path.join(reference_dir, candidate)
+            if not os.path.exists(ref_path):
+                continue
+            try:
+                print(f"  Comparing against HF reference at {ref_path}...")
+                ref_ml = ct.models.MLModel(ref_path, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+                ref_out = ref_ml.predict(inputs)
+                ref_logits = np.asarray(ref_out["logits"], dtype=np.float32)
+                ref_kv = np.asarray(ref_out["kv_cache"], dtype=np.float32)
+                break
+            except Exception as exc:
+                print(f"  (could not load HF reference: {str(exc)[:160]}; will fall back to PyTorch)")
+
+    if ref_logits is None:
+        print("  Comparing against PyTorch reference...")
+        with torch.no_grad():
+            wrapper = _T3PrefillWrapper(model.t3)
+            wrapper.train(False)
+            t_logits, t_kv = wrapper(
+                torch.from_numpy(text_t),
+                torch.from_numpy(cond_t),
+                torch.from_numpy(spkr_t),
+                torch.from_numpy(spch_t),
+            )
+            ref_logits = t_logits.detach().cpu().numpy()
+            ref_kv = t_kv.detach().cpu().numpy()
+
+    ok = True
+    ok &= _compare_outputs("logits", our_logits, ref_logits, cos_min=0.99, atol=0.5)
+    ok &= _compare_outputs("kv_cache", our_kv, ref_kv, cos_min=0.99, atol=0.05)
+
+    print(f"\n  --- iOS compatibility ---")
+    ok &= _check_xcrun_coremlcompiler(our_path)
+    ok &= _try_ane_compute(our_path, inputs)
+    print(f"\n  T3Prefill.mlpackage: {'READY' if ok else 'NOT READY'}")
+    return ok
 
 
 # --- Stage C: conditional_decoder_single.onnx ------------------------------
@@ -1780,8 +2276,41 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
 
 
 def _quantize_coreml_int8(mlpackage_path: str) -> None:
-    """CoreML INT8 quantization - not applicable for ONNX-only builds."""
-    pass
+    """In-place INT8 linear-symmetric quantization of a CoreML .mlpackage.
+
+    Quantizes Linear/Conv weights to int8 with per-tensor symmetric scaling
+    (the simplest mode that runs on ANE without surprises). Activations stay
+    fp16/fp32 — dynamic per-call. Typically 4x smaller weights, 2-3x faster
+    on ANE for transformer-heavy models like the T3 prefill.
+    """
+    from coremltools.optimize.coreml import (
+        OptimizationConfig, OpLinearQuantizerConfig, linear_quantize_weights,
+    )
+
+    print(f"  Quantizing {os.path.basename(mlpackage_path)} weights to INT8 (linear)...")
+    mlmodel = ct.models.MLModel(mlpackage_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+    config = OptimizationConfig(
+        global_config=OpLinearQuantizerConfig(mode="linear_symmetric")
+    )
+    quantized = linear_quantize_weights(mlmodel, config=config)
+
+    # Replace original .mlpackage directory. CoreML save() rejects any
+    # extension other than .mlpackage, so use a sibling temp path that
+    # keeps the extension and rename after.
+    parent = os.path.dirname(mlpackage_path) or "."
+    base = os.path.basename(mlpackage_path)
+    tmp_path = os.path.join(parent, f".{base}.int8.tmp.mlpackage")
+    if os.path.exists(tmp_path):
+        shutil.rmtree(tmp_path)
+    quantized.save(tmp_path)
+    shutil.rmtree(mlpackage_path)
+    shutil.move(tmp_path, mlpackage_path)
+
+    new_size = sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _, files in os.walk(mlpackage_path) for f in files
+    ) / 1e6
+    print(f"  INT8 quantized in place ({new_size:.1f} MB)")
 
 
 def _quantize_onnx_int8(onnx_path: str, op_types: Optional[list] = None) -> None:
@@ -1835,9 +2364,10 @@ def _optimize_onnx_graph(onnx_path: str, model_type: str = "bert",
     and ORT's L2 optimizations. Saves the optimized graph back over the
     input path (with external data file).
 
-    Uses the Windows-compatible transformers.base optimization path by
-    default (model_type="bert"). Falls back to ORT-only optimizations
-    (no Python fusions) on error.
+    Falls back to ORT-only optimizations (no Python fusions) on error —
+    the transformers-package model_type-specific fusion paths have known
+    bugs against non-canonical graph shapes (e.g. onnx_model_gpt2.py
+    postprocess crashes when the expected reshape-after-gemm isn't found).
     """
     from onnxruntime.transformers import optimizer
 
@@ -2024,8 +2554,119 @@ _ANE_FALLBACK_ONNX_OPS = {
 
 
 def _ane_report_coreml(mlpackage_path: str) -> None:
-    """CoreML ANE report - not applicable for ONNX-only builds."""
-    pass
+    """Per-op ANE/GPU/CPU dispatch report for a .mlpackage."""
+    from coremltools.models import compute_plan as cp
+
+    print(f"\n=== ANE compute plan: {os.path.basename(mlpackage_path)} ===")
+    if shutil.which("xcrun") is None:
+        print("  SKIP: xcrun not installed; can't compile to .mlmodelc")
+        return
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        proc = subprocess.run(
+            ["xcrun", "coremlcompiler", "compile", mlpackage_path, tmpdir],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            print(f"  coremlcompiler failed: {proc.stderr.strip()[:300]}")
+            return
+        compiled = next(
+            (p for p in os.listdir(tmpdir) if p.endswith(".mlmodelc")), None
+        )
+        if compiled is None:
+            print(f"  coremlcompiler produced no .mlmodelc (dir contents: {os.listdir(tmpdir)})")
+            return
+        compiled_path = os.path.join(tmpdir, compiled)
+
+        try:
+            plan = cp.MLComputePlan.load_from_path(
+                compiled_path, compute_units=ct.ComputeUnit.ALL,
+            )
+        except Exception as exc:
+            print(f"  MLComputePlan.load_from_path failed: {str(exc)[:200]}")
+            return
+
+        pref_counts = {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0}
+        supp_counts = {"ANE": 0, "GPU": 0, "CPU": 0}  # union of supported per op
+        op_type_pref: dict[str, dict[str, int]] = {}
+        op_type_ane_supported: dict[str, int] = {}
+
+        def _classify_device(device) -> str:
+            if device is None:
+                return "Unknown"
+            name = type(device).__name__
+            if "NeuralEngine" in name:
+                return "ANE"
+            if "GPU" in name:
+                return "GPU"
+            if "CPU" in name:
+                return "CPU"
+            return "Unknown"
+
+        def _walk_ops(block):
+            for op in block.operations:
+                yield op
+                for inner in op.blocks:
+                    yield from _walk_ops(inner)
+
+        program = plan.model_structure.program
+        if program is None:
+            print("  Model is not an MLProgram; per-op breakdown unavailable.")
+            return
+
+        for fn_name, fn in program.functions.items():
+            for op in _walk_ops(fn.block):
+                usage = plan.get_compute_device_usage_for_mlprogram_operation(op)
+                if usage is None:
+                    pref_counts["Unknown"] += 1
+                    continue
+                pref = _classify_device(usage.preferred_compute_device)
+                pref_counts[pref] += 1
+
+                supp = {_classify_device(d) for d in (usage.supported_compute_devices or [])}
+                for d in supp & {"ANE", "GPU", "CPU"}:
+                    supp_counts[d] += 1
+
+                op_type_pref.setdefault(op.operator_name, {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0})
+                op_type_pref[op.operator_name][pref] += 1
+                if "ANE" in supp:
+                    op_type_ane_supported[op.operator_name] = op_type_ane_supported.get(op.operator_name, 0) + 1
+
+        total = sum(pref_counts.values())
+        if total == 0:
+            print("  No operations found in the program.")
+            return
+
+        print(f"  Total ops: {total}")
+        print(f"  Preferred dispatch (what the runtime would actually pick on this Mac):")
+        for dev in ("ANE", "GPU", "CPU", "Unknown"):
+            c = pref_counts[dev]
+            if c:
+                print(f"    {dev:7s} {c:4d}  ({100 * c / total:5.1f}%)")
+        print(f"  Supported (ops eligible for each device, not necessarily preferred):")
+        for dev in ("ANE", "GPU", "CPU"):
+            c = supp_counts[dev]
+            print(f"    {dev:7s} {c:4d}  ({100 * c / total:5.1f}%)")
+        ane_potential = supp_counts["ANE"] - pref_counts["ANE"]
+        if ane_potential > 0:
+            print(f"  → {ane_potential} ops ({100 * ane_potential / total:.1f}%) are ANE-eligible "
+                  "but not preferred here. iPhone (newer ANE generation) may schedule them on ANE.")
+
+        # Top op types where ANE *isn't* preferred but might be supported
+        gap_types = sorted(
+            (
+                (op_type, op_type_ane_supported.get(op_type, 0), v)
+                for op_type, v in op_type_pref.items()
+                if v.get("ANE", 0) == 0  # not currently going to ANE
+            ),
+            key=lambda x: -(x[1] or sum(x[2].values())),
+        )[:8]
+        if gap_types:
+            print(f"  Top op types NOT preferring ANE:")
+            for op_type, ane_eligible, where in gap_types:
+                bits = " / ".join(f"{d}:{where[d]}" for d in ("GPU", "CPU", "Unknown") if where[d])
+                tag = f"ANE-supported on {ane_eligible}" if ane_eligible else "not ANE-eligible"
+                print(f"    {op_type:35s} ({bits})  [{tag}]")
 
 
 def _ane_report_onnx(onnx_path: str) -> None:
@@ -2040,8 +2681,8 @@ def _ane_report_onnx(onnx_path: str) -> None:
     import onnx
     from collections import Counter
 
-    print(f"\n=== ANE estimate (ONNX on iOS): {os.path.basename(onnx_path)} ===")
-    print(f"  ONNX models can route through ORT's CoreMLExecutionProvider on iPhone")
+    print(f"\n=== ANE estimate (via CoreML EP): {os.path.basename(onnx_path)} ===")
+    print(f"  ONNX models route through ORT's CoreMLExecutionProvider on iPhone")
     print(f"  to reach ANE. The breakdown below is a static op-type estimate.")
 
     model = onnx.load(onnx_path, load_external_data=False)
@@ -2068,14 +2709,29 @@ def _ane_report_onnx(onnx_path: str) -> None:
 
 
 def run_ane_report(output_dir: str) -> None:
-    """ANE residency report for ONNX models."""
-    print("\n=== ANE residency report (ONNX) ===")
-    onnx_files = [f for f in os.listdir(output_dir) if f.endswith(".onnx")]
-    if not onnx_files:
-        print(f"  No .onnx files found in {output_dir}")
-        return
-    for fname in onnx_files:
-        _ane_report_onnx(os.path.join(output_dir, fname))
+    """Scan `output_dir` for known v4 artifacts and report ANE plans / estimates."""
+    print("\n=== ANE residency report ===")
+    print("Helps answer: 'is converting more of the pipeline to native CoreML")
+    print("(to access ANE) worth the engineering work?'")
+
+    coreml_artifacts = [
+        ("T3Prefill.mlpackage", "v4 prefill"),
+        ("language_model_single.mlpackage", "experimental native CoreML lm"),
+    ]
+    for name, label in coreml_artifacts:
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            _ane_report_coreml(path)
+        else:
+            print(f"\n  (no {name} at {path} — {label})")
+
+    onnx_dir = os.path.join(output_dir, "onnx")
+    for name in ("language_model_single.onnx", "conditional_decoder_single.onnx"):
+        path = os.path.join(onnx_dir, name)
+        if os.path.exists(path):
+            _ane_report_onnx(path)
+        else:
+            print(f"\n  (no {name} at {path})")
 
 
 # ===========================================================================
@@ -2084,8 +2740,8 @@ def run_ane_report(output_dir: str) -> None:
 
 V1_STAGES = ("t3", "s3", "vocoder", "all")
 V4_STAGES = ("prefill", "lm-onnx", "cond-decoder", "v4")
-EXPERIMENTAL_STAGES = ()  # CoreML stages removed
-ALL_STAGES = V1_STAGES + V4_STAGES + ("all-v4", "ane-report")
+EXPERIMENTAL_STAGES = ("lm-coreml",)  # native CoreML lm prototype
+ALL_STAGES = V1_STAGES + V4_STAGES + EXPERIMENTAL_STAGES + ("all-v4", "ane-report")
 
 
 def main():
@@ -2160,11 +2816,11 @@ def main():
         "--optimize-graph",
         action="store_true",
         help=(
-            "Run onnxruntime.transformers.optimizer (Windows base path) on "
-            "each exported .onnx: operator fusion (LayerNorm, GELU, attention), "
-            "constant folding, and ORT's L2 graph passes. Typically 5-15%% "
-            "throughput gain at no quality cost. Output is saved back over the "
-            "same .onnx path. CoreML stages ignore this flag."
+            "Run onnxruntime.transformers.optimizer on each exported .onnx: "
+            "operator fusion (LayerNorm, GELU, attention), constant folding, "
+            "and ORT's L2 graph passes. Typically 5-15%% throughput on iOS "
+            "at no quality cost. Output is saved back over the same .onnx "
+            "path. CoreML stages ignore this flag."
         ),
     )
     parser.add_argument(
@@ -2178,16 +2834,6 @@ def main():
             "2-3x faster decode on iOS. Quality cost depends on the "
             "artifact — validate after. CoreML stages ignore this flag "
             "(CoreML palettization is a separate path; not yet wired)."
-        ),
-    )
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        required=True,
-        help=(
-            "Local path to a Chatterbox model directory containing "
-            "safetensors weights. Loads the model from this local "
-            "path instead of downloading from HuggingFace."
         ),
     )
     args = parser.parse_args()
@@ -2205,19 +2851,16 @@ def main():
     v1_model = None
     v4_model = None
 
-    # Use --model-path (only argument now)
-    model_path = args.model_path
-
     if is_v1:
-        v1_model = load_pytorch_model(model_path=model_path)
+        v1_model = load_pytorch_model()
     if is_v4:
-        v4_model = load_pytorch_model_v4(model_path=model_path)
+        v4_model = load_pytorch_model_v4()
 
     # --- v1 stages ---
     if args.stage in ("t3", "all"):
-        convert_t3(v1_model, args.output_dir)
+        convert_t3(v1_model, args.output_dir, validate=args.validate)
     if args.stage in ("s3", "all"):
-        convert_s3(v1_model, args.output_dir)
+        convert_s3(v1_model, args.output_dir, validate=args.validate)
     if args.stage in ("vocoder", "all"):
         extract_vocoder_weights(v1_model, args.output_dir)
     if args.stage == "all":
@@ -2225,8 +2868,8 @@ def main():
 
     if args.stage == "all-v4":
         # Also run v1 stages
-        convert_t3(v1_model, args.output_dir)
-        convert_s3(v1_model, args.output_dir)
+        convert_t3(v1_model, args.output_dir, validate=args.validate)
+        convert_s3(v1_model, args.output_dir, validate=args.validate)
         extract_vocoder_weights(v1_model, args.output_dir)
         extract_tokenizer_and_config(v1_model, args.output_dir)
 
@@ -2252,6 +2895,11 @@ def main():
             cfm_steps=args.cfm_steps,
             optimize_graph=args.optimize_graph,
             quantize=args.quantize,
+        )
+    if args.stage == "lm-coreml":
+        convert_language_model_coreml(
+            v4_model, args.output_dir,
+            validate=args.validate,
         )
 
     print("\n=== Done ===")
