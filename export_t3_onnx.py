@@ -1,422 +1,295 @@
 #!/usr/bin/env python3
 """
-Export T3 language model to ONNX format following the exact logic from convert_chatterbox_coreml.py.
-
-This script exports language_model_single.onnx - the GPT-2 single-step decoder with KV cache.
-It uses the _LanguageModelWrapper pattern from the original script to avoid tracing issues.
-
-Usage:
-    python export_t3_onnx.py --weights t3_turbo_finetuned_merged.safetensors --output-dir ./onnx_models --optimize-graph
+Standalone script to export T3 Turbo (GPT-2 based) to ONNX.
+Logic extracted from convert_chatterbox_coreml.py but self-contained.
+Avoids modifying external library configs.
 """
 
-import argparse
-import os
-import sys
-from pathlib import Path
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import argparse
+import os
+import sys
+from collections import Counter
 from safetensors.torch import load_file
 
-# Constants matching Chatterbox Turbo's architecture
-GPT2_HIDDEN = 1024
-GPT2_HEADS = 16
-GPT2_LAYERS = 24
-GPT2_MAX_POS = 8196
-GPT2_HEAD_DIM = GPT2_HIDDEN // GPT2_HEADS  # 64
-TEXT_VOCAB_SIZE = 50276
+# Try to import onnxruntime for optimization, but make it optional for the export step
+try:
+    from onnxruntime.transformers.optimizer import optimize_model
+    HAS_ORT = True
+except ImportError:
+    HAS_ORT = False
+    print("Warning: onnxruntime-transformers not found. Graph optimization (GroupQueryAttention) will be skipped.")
 
-
-def _get_gpt2_medium_config():
-    """Return GPT2_medium config dict."""
-    return {
-        "activation_function": "gelu_new",
-        "architectures": ["GPT2LMHeadModel"],
-        "attn_pdrop": 0.1,
-        "bos_token_id": 50256,
-        "embd_pdrop": 0.1,
-        "eos_token_id": 50256,
-        "initializer_range": 0.02,
-        "layer_norm_epsilon": 1e-05,
-        "model_type": "gpt2",
-        "n_ctx": GPT2_MAX_POS,
-        "n_embd": GPT2_HIDDEN,
-        "hidden_size": GPT2_HIDDEN,
-        "n_head": GPT2_HEADS,
-        "n_layer": GPT2_LAYERS,
-        "n_positions": GPT2_MAX_POS,
-        "n_special": 0,
-        "predict_special_tokens": True,
-        "resid_pdrop": 0.1,
-        "summary_activation": None,
-        "summary_first_dropout": 0.1,
-        "summary_proj_to_labels": True,
-        "summary_type": "cls_index",
-        "summary_use_proj": True,
-        "vocab_size": TEXT_VOCAB_SIZE,
-    }
-
-
-class _LanguageModelWrapper(nn.Module):
-    """Stateful T3 wrapper for ONNX export.
-    
-    This is the EXACT wrapper from convert_chatterbox_coreml.py (lines 1027-1123).
-    It re-implements GPT-2 attention using primitives to avoid tracing issues 
-    with HuggingFace's Cache utility.
-    
-    Takes pre-computed embeddings (not token IDs) and manages per-layer KV cache 
-    as separate inputs/outputs.
-    """
-    
-    def __init__(self, t3_model):
+class T3TransformerBlock(nn.Module):
+    """Single Transformer Block (GPT-2 style)"""
+    def __init__(self, n_embd, n_head):
         super().__init__()
-        self.t3 = t3_model
+        self.ln_1 = nn.LayerNorm(n_embd)
         
-        # Extract components from T3 model
-        # T3 structure: t3.tfmr.h contains the 24 transformer blocks
-        # t3.cond_enc.spkr_enc is the speaker encoder
-        # t3.text_emb, t3.speech_emb are embeddings
-        # t3.speech_head is the output head
+        self.n_head = n_head
+        self.n_embd = n_embd
         
-        self.n_layer = GPT2_LAYERS
-        self.n_head = GPT2_HEADS
-        self.head_dim = GPT2_HEAD_DIM
-        self.hidden = GPT2_HIDDEN
+        # Custom attention to support fused c_attn loading
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
         
-        # Register the transformer blocks
-        self.h = t3_model.tfmr.h
-        
-        # Final layer norm
-        self.ln_f = t3_model.tfmr.ln_f
-        
-        # Output head (speech prediction)
-        self.speech_head = t3_model.speech_head
-        
-    def forward(self, inputs_embeds, attention_mask, position_ids, *past_key_values):
-        """Forward pass with KV cache.
-        
-        Args:
-            inputs_embeds: (batch, seq_len, hidden) - pre-computed embeddings
-            attention_mask: (batch, total_seq_len) - attention mask
-            position_ids: (batch, seq_len) - position indices
-            past_key_values: 48 tensors (key, value for each of 24 layers)
-                            Each: (batch, heads, past_len, head_dim)
-        
-        Returns:
-            logits: (batch, seq_len, vocab_size) - speech token logits
-            present_key_values: 48 tensors - updated KV cache
-        """
-        batch_size = inputs_embeds.shape[0]
-        seq_len = inputs_embeds.shape[1]
-        
-        # Split past_key_values into list of (key, value) tuples
-        pkv_list = []
-        for i in range(self.n_layer):
-            key = past_key_values[2 * i]
-            value = past_key_values[2 * i + 1]
-            pkv_list.append((key, value))
-        
-        hidden = inputs_embeds
-        
-        # Process each transformer block
-        presents = []
-        for i, block in enumerate(self.h):
-            past_key, past_value = pkv_list[i]
-            
-            # Get block components
-            # GPT2Block structure: ln_1, attn (c_attn, c_proj), ln_2, mlp (c_fc, c_proj)
-            ln_1 = block.ln_1
-            attn = block.attn
-            ln_2 = block.ln_2
-            mlp = block.mlp
-            
-            # Self-attention with manual implementation
-            residual = hidden
-            hidden = ln_1(hidden)
-            
-            # Compute Q, K, V
-            query, key, value = attn.c_attn(hidden).split(self.hidden, dim=-1)
-            
-            # Reshape for multi-head attention
-            query = query.view(batch_size, -1, self.n_head, self.head_dim).transpose(1, 2)
-            key = key.view(batch_size, -1, self.n_head, self.head_dim).transpose(1, 2)
-            value = value.view(batch_size, -1, self.n_head, self.head_dim).transpose(1, 2)
-            
-            # Concatenate with past KV
-            key = torch.cat([past_key, key], dim=-2)
-            value = torch.cat([past_value, value], dim=-2)
-            
-            # Scaled dot-product attention
-            attn_output = F.scaled_dot_product_attention(
-                query, key, value, 
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=True
-            )
-            
-            # Reshape back
-            attn_output = attn_output.transpose(1, 2).contiguous().view(
-                batch_size, -1, self.hidden
-            )
-            
-            # Output projection
-            hidden = residual + attn.c_proj(attn_output)
-            
-            # Store updated KV cache
-            presents.append(key)
-            presents.append(value)
-            
-            # MLP block
-            residual = hidden
-            hidden = ln_2(hidden)
-            hidden = residual + mlp.c_proj(F.gelu(mlp.c_fc(hidden)))
-        
-        # Final layer norm
-        hidden = self.ln_f(hidden)
-        
-        # Output head
-        logits = self.speech_head(hidden)
-        
-        return (logits, *presents)
+        self.ln_2 = nn.LayerNorm(n_embd)
+        self.mlp_c_fc = nn.Linear(n_embd, 4 * n_embd)
+        self.mlp_c_proj = nn.Linear(4 * n_embd, n_embd)
 
+    def forward(self, x):
+        B, T, C = x.size()
+        n_head = self.n_head
+        head_dim = C // n_head
+        
+        # Self Attention
+        ln1 = self.ln_1(x)
+        qkv = self.c_attn(ln1)
+        q, k, v = qkv.split(C, dim=-1)
+        
+        # Reshape for multi-head
+        q = q.view(B, T, n_head, head_dim).transpose(1, 2)
+        k = k.view(B, T, n_head, head_dim).transpose(1, 2)
+        v = v.view(B, T, n_head, head_dim).transpose(1, 2)
+        
+        y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        y = self.c_proj(y)
+        x = x + y
+        
+        # MLP
+        x = x + self.mlp_c_proj(F.gelu(self.mlp_c_fc(self.ln_2(x))))
+        return x
 
-def _lm_onnx_io_names():
-    """Generate input/output names matching the original script."""
-    input_names = ["inputs_embeds", "attention_mask", "position_ids"]
-    for i in range(GPT2_LAYERS):
-        input_names.append(f"past_key_values.{i}.key")
-        input_names.append(f"past_key_values.{i}.value")
-    
-    output_names = ["logits"]
-    for i in range(GPT2_LAYERS):
-        output_names.append(f"present.{i}.key")
-        output_names.append(f"present.{i}.value")
-    
-    return input_names, output_names
+class T3Model(nn.Module):
+    """Simplified T3 Model (Language Model part only)"""
+    def __init__(self, vocab_size, n_layer, n_head, n_embd, block_size=2048):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_embd = n_embd
+        
+        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.wpe = nn.Embedding(block_size, n_embd)
+        
+        self.h = nn.ModuleList([
+            T3TransformerBlock(n_embd, n_head) for _ in range(n_layer)
+        ])
+        
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.text_head = nn.Linear(n_embd, vocab_size, bias=False)
 
+    def forward(self, idx):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.wpe.weight.size(0), f"Cannot forward sequence of length {t}, block size is only {self.wpe.weight.size(0)}"
+        
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
 
-def _lm_onnx_dynamic_axes():
-    """Generate dynamic axes for ONNX export."""
-    dynamic_axes = {
-        "inputs_embeds": {1: "seq_len"},
-        "attention_mask": {1: "total_seq_len"},
-        "logits": {1: "seq_len"},
-    }
-    for i in range(GPT2_LAYERS):
-        dynamic_axes[f"past_key_values.{i}.key"] = {2: "past_seq_len"}
-        dynamic_axes[f"past_key_values.{i}.value"] = {2: "past_seq_len"}
-        dynamic_axes[f"present.{i}.key"] = {2: "past_seq_len"}
-        dynamic_axes[f"present.{i}.value"] = {2: "past_seq_len"}
-    
-    return dynamic_axes
+        tok_emb = self.wte(idx)
+        pos_emb = self.wpe(pos)
+        x = tok_emb + pos_emb
+        
+        for block in self.h:
+            x = block(x)
+        
+        x = self.ln_f(x)
+        logits = self.text_head(x)
+        
+        return logits
 
-
-def _load_t3_from_safetensors(weights_path):
-    """Load T3 model from safetensors file following the original script's logic."""
-    from chatterbox.models.t3.t3 import T3, T3Config
-    from chatterbox.models.t3 import llama_configs
-    import yaml
+def infer_config_from_keys(keys):
+    """Infer model configuration from state dict keys."""
+    n_layer = 0
     
-    # Inject GPT2_medium config into llama_configs
-    llama_configs["GPT2_medium"] = _get_gpt2_medium_config()
+    layer_keys = [k for k in keys if '.h.' in k]
+    if not layer_keys:
+        raise ValueError("No transformer layers found in state dict.")
     
-    # Load config from YAML (same as original script)
-    # For finetuned models, we need to infer or use default config
-    yaml_path = Path(weights_path).parent / "t3_turbo_v1.yaml"
+    max_idx = -1
+    for k in layer_keys:
+        try:
+            part = k.split('.h.')[1].split('.')[0]
+            if part.isdigit():
+                idx = int(part)
+                max_idx = max(max_idx, idx)
+        except:
+            continue
+    n_layer = max_idx + 1
     
-    if yaml_path.exists():
-        with open(yaml_path) as f:
-            cfg_dict = yaml.full_load(f)
+    # T3 Turbo is typically GPT-2 Medium: 24 layers, 16 heads, 1024 embd
+    if n_layer == 24:
+        n_embd = 1024
+        n_head = 16
+    elif n_layer == 12:
+        n_embd = 768
+        n_head = 12
+    elif n_layer == 36:
+        n_embd = 1280
+        n_head = 16
     else:
-        # Create minimal config for finetuned model
-        cfg_dict = {
-            "llama_config_name": "GPT2_medium",
-            "speaker_emb_dim": 256,
-            "campp_emb_dim": 192,
-            "encoder_type": "voice_encoder",
-        }
-    
-    # Ensure GPT2_medium config
-    cfg_dict["llama_config_name"] = "GPT2_medium"
-    
-    # Create T3Config object
-    turbo_cfg = T3Config.__new__(T3Config)
-    for k, v in cfg_dict.items():
-        setattr(turbo_cfg, k, v)
-    
-    # Add missing attributes that might cause errors
-    if not hasattr(turbo_cfg, 'speaker_embed_size'):
-        turbo_cfg.speaker_embed_size = getattr(turbo_cfg, 'speaker_emb_dim', 256)
-    
-    # Create and load model
-    t3 = T3(hp=turbo_cfg)
-    t3_state = load_file(weights_path)
-    t3.load_state_dict(t3_state)
-    t3.to("cpu").train(False)
-    
-    return t3
-
-
-def _optimize_onnx_graph(onnx_path, model_type="bert", num_heads=GPT2_HEADS, hidden_size=GPT2_HIDDEN):
-    """Optimize ONNX graph using onnxruntime transformers optimizer (from original script)."""
-    try:
-        from onnxruntime.transformers import optimizer
+        print(f"Warning: Unknown layer count {n_layer}. Assuming GPT-2 Medium config.")
+        n_embd = 1024
+        n_head = 16
         
-        print(f"  Optimizing graph (model_type={model_type!r}, full fusions)...")
-        opt = optimizer.optimize_model(
-            onnx_path,
-            model_type=model_type,
+    return n_layer, n_head, n_embd
+
+def load_and_map_weights(model, state_dict):
+    """Map weights from the flat state dict to the model."""
+    new_sd = {}
+    
+    for k, v in state_dict.items():
+        new_k = k
+        
+        # Strip 'tfmr.' prefix if present
+        if new_k.startswith('tfmr.'):
+            new_k = new_k[5:]
+        
+        # Map attention submodules
+        if '.attn.c_attn.' in new_k:
+            new_k = new_k.replace('.attn.c_attn.', '.c_attn.')
+        elif '.attn.c_proj.' in new_k:
+            new_k = new_k.replace('.attn.c_proj.', '.c_proj.')
+        elif '.mlp.c_fc.' in new_k:
+            new_k = new_k.replace('.mlp.c_fc.', '.mlp_c_fc.')
+        elif '.mlp.c_proj.' in new_k:
+            new_k = new_k.replace('.mlp.c_proj.', '.mlp_c_proj.')
+            
+        # Map embeddings and head
+        if new_k == 'text_emb.weight':
+            new_k = 'wte.weight'
+        elif new_k == 'text_head.weight':
+            new_k = 'text_head.weight'
+        elif new_k == 'ln_f.weight':
+            new_k = 'ln_f.weight'
+        elif new_k == 'ln_f.bias':
+            new_k = 'ln_f.bias'
+        
+        if new_k in model.state_dict():
+            if v.shape == model.state_dict()[new_k].shape:
+                new_sd[new_k] = v
+            else:
+                print(f"Shape mismatch for {new_k}: file {v.shape} vs model {model.state_dict()[new_k].shape}")
+        # Ignore unused keys (speaker encoder, etc.)
+
+    # Check for missing keys
+    model_sd = model.state_dict()
+    missing = set(model_sd.keys()) - set(new_sd.keys())
+    
+    if 'wpe.weight' in missing:
+        print("Warning: Positional embeddings (wpe) not found in file. Initializing randomly.")
+        missing.remove('wpe.weight')
+        
+    if missing:
+        print(f"Error: Could not map the following keys: {missing}")
+        
+    model.load_state_dict(new_sd, strict=False)
+    return model
+
+def export_onnx(model, output_path, seq_len=128):
+    model.eval()
+    device = next(model.parameters()).device
+    
+    dummy_input = torch.randint(0, model.vocab_size, (1, seq_len), dtype=torch.long).to(device)
+    
+    print(f"Exporting to ONNX (Opset 17)...")
+    
+    torch.onnx.export(
+        model,
+        dummy_input,
+        output_path,
+        export_params=True,
+        opset_version=17,
+        do_constant_folding=True,
+        input_names=['input_ids'],
+        output_names=['logits'],
+        dynamic_axes={
+            'input_ids': {0: 'batch', 1: 'sequence'},
+            'logits': {0: 'batch', 1: 'sequence'}
+        },
+        verbose=False
+    )
+    print(f"Saved raw ONNX to {output_path}")
+
+def optimize_onnx(output_path):
+    if not HAS_ORT:
+        return
+    
+    print("Optimizing ONNX graph (converting to GroupQueryAttention)...")
+    try:
+        num_heads = 16
+        hidden_size = 1024
+        
+        opt_model = optimize_model(
+            output_path,
+            model_type='gpt2',
             num_heads=num_heads,
             hidden_size=hidden_size,
-            opt_level=1,
-            only_onnxruntime=False,
+            opt_level=99,
+            only_onnxruntime=False
         )
-        opt.save_model_to_file(onnx_path, use_external_data_format=True)
         
-        new_size = os.path.getsize(onnx_path) / 1e6
-        data_path = onnx_path + ".data"
-        if os.path.exists(data_path):
-            new_size += os.path.getsize(data_path) / 1e6
-        print(f"  Optimized graph saved ({new_size:.1f} MB total)")
+        opt_model.save_model_to_file(output_path)
+        print(f"Saved optimized ONNX to {output_path}")
         
-    except Exception as exc:
-        print(f"  Optimization failed ({type(exc).__name__}): {str(exc)[:200]}")
-        print("  Retrying with ORT-only optimizations...")
-        try:
-            from onnxruntime.transformers import optimizer
-            opt = optimizer.optimize_model(
-                onnx_path,
-                model_type="bert",
-                num_heads=num_heads,
-                hidden_size=hidden_size,
-                opt_level=1,
-                only_onnxruntime=True,
-            )
-            opt.save_model_to_file(onnx_path, use_external_data_format=True)
-            print("  ORT-only optimization successful")
-        except Exception as exc2:
-            print(f"  Graph optimization disabled — {type(exc2).__name__}: {str(exc2)[:200]}")
-
-
-def count_node_types(onnx_path):
-    """Count node types in ONNX model."""
-    import onnx
-    from collections import Counter
-    
-    # Load model (handle external data)
-    model = onnx.load(onnx_path)
-    
-    # Count node types
-    node_counts = Counter(node.op_type for node in model.graph.node)
-    return node_counts
-
-
-def print_node_distribution(node_counts):
-    """Print node type distribution in the requested format."""
-    print("\n--- Node Type Distribution ---")
-    for op_type, count in sorted(node_counts.items()):
-        print(f"  {op_type}: {count}")
-
-
-def export_language_model_onnx(weights_path, output_dir, optimize_graph=False):
-    """Export T3 language model to ONNX following the exact logic from convert_chatterbox_coreml.py."""
-    print(f"\n=== Exporting language_model_single.onnx ===")
-    print(f"Loading T3 model from: {weights_path}")
-    
-    # Load T3 model
-    t3 = _load_t3_from_safetensors(weights_path)
-    
-    # Create wrapper
-    wrapper = _LanguageModelWrapper(t3)
-    wrapper.train(False)
-    
-    # Create output directory
-    onnx_dir = os.path.join(output_dir, "onnx")
-    os.makedirs(onnx_dir, exist_ok=True)
-    out_path = os.path.join(onnx_dir, "language_model_single.onnx")
-    
-    # Prepare dummy inputs (matching original script)
-    past_len = 10
-    embeds_t = torch.randn(1, 1, GPT2_HIDDEN, dtype=torch.float32) * 0.02
-    mask_t = torch.ones(1, past_len + 1, dtype=torch.int64)
-    pos_t = torch.tensor([[past_len]], dtype=torch.int64)
-    
-    flat_pkv_t = []
-    for _ in range(GPT2_LAYERS):
-        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
-        flat_pkv_t.append(torch.randn(1, GPT2_HEADS, past_len, GPT2_HEAD_DIM) * 0.1)
-    
-    # Get IO names and dynamic axes
-    input_names, output_names = _lm_onnx_io_names()
-    dynamic_axes = _lm_onnx_dynamic_axes()
-    
-    # Export to ONNX
-    print(f"  Exporting to {out_path} (opset 17)...")
-    with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (embeds_t, mask_t, pos_t, *flat_pkv_t),
-            out_path,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            opset_version=17,
-            do_constant_folding=True,
-        )
-    
-    size_mb = os.path.getsize(out_path) / 1e6
-    print(f"  Wrote {size_mb:.1f} MB")
-    
-    # Optimize if requested
-    if optimize_graph:
-        _optimize_onnx_graph(out_path)
-    
-    # Count and print node types
-    node_counts = count_node_types(out_path)
-    print_node_distribution(node_counts)
-    
-    print(f"\nONNX model saved to: {out_path}")
-    return out_path
-
+        import onnx
+        onnx_model = onnx.load(output_path)
+        nodes = [node.op_type for node in onnx_model.graph.node]
+        counts = Counter(nodes)
+        
+        print("\n--- Node Type Distribution ---")
+        for op, count in sorted(counts.items()):
+            print(f"  {op}: {count}")
+            
+    except Exception as e:
+        print(f"Optimization failed: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Export T3 language model to ONNX (following convert_chatterbox_coreml.py)"
-    )
-    parser.add_argument(
-        "--weights", 
-        type=str, 
-        required=True,
-        help="Path to the .safetensors file (e.g., t3_turbo_finetuned_merged.safetensors)"
-    )
-    parser.add_argument(
-        "--output-dir", 
-        type=str, 
-        default="./onnx_models",
-        help="Output directory for ONNX model"
-    )
-    parser.add_argument(
-        "--optimize-graph", 
-        action="store_true",
-        help="Apply ONNX graph optimization (enables GroupQueryAttention fusion)"
-    )
+    parser = argparse.ArgumentParser(description="Export T3 to ONNX")
+    parser.add_argument("--weights", type=str, required=True, help="Path to .safetensors")
+    parser.add_argument("--output-dir", type=str, default="./onnx_models", help="Output dir")
+    parser.add_argument("--seq-len", type=int, default=128, help="Sequence length for export trace")
+    parser.add_argument("--optimize", action="store_true", help="Run ORT optimizer")
     
     args = parser.parse_args()
     
-    # Validate input file
-    if not os.path.exists(args.weights):
-        print(f"ERROR: Weights file not found: {args.weights}")
-        sys.exit(1)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Export model
-    export_language_model_onnx(
-        args.weights,
-        args.output_dir,
-        optimize_graph=args.optimize_graph
-    )
-
+    print(f"Loading weights from {args.weights}...")
+    state_dict = load_file(args.weights)
+    keys = list(state_dict.keys())
+    
+    print(f"--- Inspecting State Dict ({len(keys)} keys) ---")
+    for k in keys[:10]:
+        print(f"  {k}")
+    
+    n_layer, n_head, n_embd = infer_config_from_keys(keys)
+    
+    vocab_size = 50276
+    for k, v in state_dict.items():
+        if k == 'text_emb.weight':
+            vocab_size = v.shape[0]
+            break
+            
+    print(f"Inferred Config: Layers={n_layer}, Heads={n_head}, Embd={n_embd}, Vocab={vocab_size}")
+    
+    print("Initializing model...")
+    model = T3Model(vocab_size=vocab_size, n_layer=n_layer, n_head=n_head, n_embd=n_embd)
+    
+    print("Mapping weights...")
+    model = load_and_map_weights(model, state_dict)
+    
+    out_path = os.path.join(args.output_dir, "language_model_single.onnx")
+    export_onnx(model, out_path, seq_len=args.seq_len)
+    
+    if args.optimize:
+        optimize_onnx(out_path)
+    
+    print("Done.")
 
 if __name__ == "__main__":
     main()
