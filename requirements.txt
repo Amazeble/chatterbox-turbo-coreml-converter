@@ -10,6 +10,7 @@ transformers>=4.55,<5.0
 pyyaml>=6.0
 onnx>=1.17
 onnxruntime>=1.18
+onnx-simplifier>=0.4
 # onnxscript is required by torch.onnx.export(..., dynamo=True), which is
 # what we use for the v4 LM and conditional_decoder ONNX exports — the
 # legacy TorchScript-based exporter chokes on HF DynamicCache.

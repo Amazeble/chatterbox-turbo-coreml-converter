@@ -22,6 +22,14 @@ except ImportError:
     HAS_ORT = False
     print("Warning: onnxruntime-transformers not found. Graph optimization (GroupQueryAttention) will be skipped.")
 
+# Try to import onnx-simplifier for graph simplification
+try:
+    import onnxsim
+    HAS_ONNXSIM = True
+except ImportError:
+    HAS_ONNXSIM = False
+    print("Warning: onnx-simplifier not found. Run 'pip install onnx-simplifier' for better graph optimization.")
+
 class T3TransformerBlock(nn.Module):
     """Single Transformer Block (GPT-2 style)"""
     def __init__(self, n_embd, n_head):
@@ -216,6 +224,33 @@ def export_onnx(model, output_path, seq_len=128):
     )
     print(f"Saved raw ONNX to {output_path}")
 
+def simplify_onnx(output_path):
+    """Simplify ONNX model using onnx-simplifier to reduce unnecessary ops."""
+    if not HAS_ONNXSIM:
+        print("Skipping onnx-simplifier optimization (not installed).")
+        return
+    
+    print("Simplifying ONNX graph with onnx-simplifier...")
+    try:
+        import onnx
+        model = onnx.load(output_path)
+        model_simp, check = onnxsim.simplify(model)
+        assert check, "Simplified ONNX model validation failed"
+        
+        onnx.save(model_simp, output_path)
+        print(f"Saved simplified ONNX to {output_path}")
+        
+        # Print node distribution after simplification
+        nodes = [node.op_type for node in model_simp.graph.node]
+        counts = Counter(nodes)
+        
+        print("\n--- Node Type Distribution (After Simplification) ---")
+        for op, count in sorted(counts.items()):
+            print(f"  {op}: {count}")
+            
+    except Exception as e:
+        print(f"Simplification failed: {e}")
+
 def optimize_onnx(output_path):
     if not HAS_ORT:
         return
@@ -254,6 +289,7 @@ def main():
     parser.add_argument("--weights", type=str, required=True, help="Path to .safetensors")
     parser.add_argument("--output-dir", type=str, default="./onnx_models", help="Output dir")
     parser.add_argument("--seq-len", type=int, default=128, help="Sequence length for export trace")
+    parser.add_argument("--simplify", action="store_true", help="Run onnx-simplifier to reduce ops")
     parser.add_argument("--optimize", action="store_true", help="Run ORT optimizer")
     
     args = parser.parse_args()
@@ -286,6 +322,9 @@ def main():
     
     out_path = os.path.join(args.output_dir, "language_model_single.onnx")
     export_onnx(model, out_path, seq_len=args.seq_len)
+    
+    if args.simplify:
+        simplify_onnx(out_path)
     
     if args.optimize:
         optimize_onnx(out_path)
