@@ -217,10 +217,14 @@ def _load_t3_from_safetensors(weights_path):
         "speaker_emb_dim": 256,
         "campp_emb_dim": 192,
         "mel_bins": 80,
+        "encoder_type": "voice_encoder",  # Required by T3CondEnc
     }
     turbo_cfg = T3Config.__new__(T3Config)
     for k, v in turbo_cfg_dict.items():
         setattr(turbo_cfg, k, v)
+    
+    # Also need to set nested llama config
+    turbo_cfg.llama_config = llama_configs["GPT2_medium"]
     
     # Instantiate model and load weights
     t3 = T3(hp=turbo_cfg)
