@@ -34,6 +34,15 @@ import torch.nn as nn
 import coremltools as ct
 from safetensors.torch import save_file as save_safetensors
 
+import sys
+# 1. Force import the custom Llama modules directly from the installed chatterbox package
+try:
+    from chatterbox.models.t3.inference.custom_llama import modeling_llama
+    # 2. Inject it directly into sys.modules so third-party serializers find it at root level
+    sys.modules['LlamaModel'] = modeling_llama
+    sys.modules['modeling_llama'] = modeling_llama
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Constants matching Chatterbox Turbo's architecture
@@ -90,12 +99,21 @@ _GPT2_MEDIUM_CONFIG = {
 
 
 def _ensure_chatterbox_gpt2_config():
-    from chatterbox.models.t3 import llama_configs as _lc
+    # Force mock object creation to completely bypass the broken LlamaModel import chain
+    import sys
+    from types import ModuleType
 
+    # Create a dynamic mock module for llama_configs if it crashes or drops during standard import
+    try:
+        from chatterbox.models.t3 import llama_configs as _lc
+    except Exception:
+        _lc = ModuleType("llama_configs")
+        _lc.LLAMA_CONFIGS = {}
+        sys.modules["chatterbox.models.t3.llama_configs"] = _lc
+
+    # Directly inject the configuration dictionary asset bypassing upstream validation checks
     if "GPT2_medium" not in _lc.LLAMA_CONFIGS:
         _lc.LLAMA_CONFIGS["GPT2_medium"] = _GPT2_MEDIUM_CONFIG
-
-
 # ---------------------------------------------------------------------------
 # Stateful KV cache + patched GPT-2 attention for ANE StateType decode
 # ---------------------------------------------------------------------------
@@ -251,6 +269,7 @@ def load_pytorch_model(model_dir):
     Args:
         model_dir: Path to local directory containing model files
     """
+    # Execute the updated safe configuration hook
     _ensure_chatterbox_gpt2_config()
 
     from safetensors.torch import load_file
@@ -262,6 +281,14 @@ def load_pytorch_model(model_dir):
     print(f"  Model dir: {model_dir}")
 
     print("  Loading T3 (GPT-2 Medium turbo)...")
+    
+    # We must hot-patch sys.modules immediately prior to class execution 
+    # to intercept downstream llama_configs dependency evaluation loops.
+    import sys
+    from chatterbox.models.t3 import llama_configs as _lc
+    sys.modules["LlamaModel"] = _lc
+    sys.modules["modeling_llama"] = _lc
+
     from chatterbox.models.t3.t3 import T3, T3Config
     import yaml
 
@@ -304,7 +331,7 @@ def load_pytorch_model_v4(model_dir):
     print(f"Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('{model_dir}')...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-    tts = ChatterboxTurboTTS.from_pretrained(model_dir, device="cpu")
+    tts = ChatterboxTurboTTS.from_pretrained(model_dir)
     tts.t3.train(False)
     tts.s3gen.train(False)
     model_dir = Path(model_dir)
@@ -2927,4 +2954,35 @@ def main():
 
 
 if __name__ == "__main__":
+    # --- HARD SPOOF CRITICAL: Bypassing transformers dynamic lazy loader bug ---
+    import sys
+    import transformers
+    from types import ModuleType
+
+    # 1. Fetch real, functional classes from their proper nested layout locations
+    from transformers.models.gpt2.modeling_gpt2 import GPT2Model
+    from transformers.models.gpt2.configuration_gpt2 import GPT2Config
+    from transformers.models.llama.modeling_llama import LlamaModel, LlamaConfig
+
+    # 2. Bind them explicitly into transformers namespace dictionary properties
+    setattr(transformers, "GPT2Model", GPT2Model)
+    setattr(transformers, "GPT2Config", GPT2Config)
+    setattr(transformers, "LlamaModel", LlamaModel)
+    setattr(transformers, "LlamaConfig", LlamaConfig)
+
+    # 3. Create a static mock module to intercept any internal lookups 
+    mock_engine = ModuleType("transformers.models.llama.modeling_llama")
+    mock_engine.LlamaModel = LlamaModel
+    mock_engine.LlamaConfig = LlamaConfig
+    mock_engine.GPT2Model = GPT2Model
+    mock_engine.GPT2Config = GPT2Config
+
+    # 4. Bind the lookup paths so python shortcuts the lazy-loading crash loops
+    sys.modules["transformers.models.llama.modeling_llama"] = mock_engine
+    sys.modules["LlamaModel"] = mock_engine
+    sys.modules["GPT2Model"] = mock_engine
+    sys.modules["modeling_llama"] = mock_engine
+    # --------------------------------------------------------------------------
+
+    # Safely execute the converter pipeline now that imports are structurally wired
     main()
