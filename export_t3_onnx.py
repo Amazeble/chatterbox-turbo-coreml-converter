@@ -29,19 +29,9 @@ GPT2_HEAD_DIM = GPT2_HIDDEN // GPT2_HEADS  # 64
 TEXT_VOCAB_SIZE = 50276
 
 
-def _ensure_chatterbox_gpt2_config():
-    """Patch chatterbox's llama_configs to include GPT2_medium config."""
-    try:
-        from chatterbox.models.t3 import llama_configs as _lc
-    except ImportError:
-        print("ERROR: 'chatterbox' library not found.")
-        print("Please install it: pip install chatterbox-tts")
-        sys.exit(1)
-    
-    if hasattr(_lc, "GPT2_medium"):
-        return
-    
-    _GPT2_MEDIUM_CONFIG = {
+def _get_gpt2_medium_config():
+    """Return GPT2_medium config dict."""
+    return {
         "activation_function": "gelu_new",
         "architectures": ["GPT2LMHeadModel"],
         "attn_pdrop": 0.1,
@@ -67,7 +57,6 @@ def _ensure_chatterbox_gpt2_config():
         "summary_use_proj": True,
         "vocab_size": TEXT_VOCAB_SIZE,
     }
-    _lc["GPT2_medium"] = _GPT2_MEDIUM_CONFIG
 
 
 class _LanguageModelWrapper(nn.Module):
@@ -226,10 +215,12 @@ def _lm_onnx_dynamic_axes():
 
 def _load_t3_from_safetensors(weights_path):
     """Load T3 model from safetensors file following the original script's logic."""
-    _ensure_chatterbox_gpt2_config()
-    
     from chatterbox.models.t3.t3 import T3, T3Config
+    from chatterbox.models.t3 import llama_configs
     import yaml
+    
+    # Inject GPT2_medium config into llama_configs
+    llama_configs["GPT2_medium"] = _get_gpt2_medium_config()
     
     # Load config from YAML (same as original script)
     # For finetuned models, we need to infer or use default config
