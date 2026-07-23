@@ -2,24 +2,38 @@
 # Compiled and build artifacts
 *.pyc
 __pycache__/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
 
 # Dependencies
 .venv/
 venv/
+.env
+.env.local
+*.env.*
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
-
-# Environment
-.env
-.env.local
-*.env.*
+*.swo
 
 # Editors
 .vscode/
 .idea/
 
-# Original rules preserved
+# Build and distribution
+build/
+dist/
+*.egg-info/
+.coverage
+coverage/
+htmlcov/
+.mypy_cache/
+.pytest_cache/
 ```
