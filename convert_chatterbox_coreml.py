@@ -240,20 +240,33 @@ class ChatterboxModels:
         self.model_dir = model_dir
 
 
-def load_pytorch_model(cache_dir=None):
-    """Download and load the Chatterbox Turbo PyTorch model components (v1 path).
+def load_pytorch_model(model_dir=None):
+    """Load the Chatterbox Turbo PyTorch model components (v1 path).
 
     Uses YAML config + manual state_dict load. v4 stages should use
     load_pytorch_model_v4() which goes through ChatterboxTurboTTS.from_pretrained
     for the meanflow-trained s3gen weights.
+    
+    Args:
+        model_dir: Optional path to local model directory. If None, uses default cache.
     """
     _ensure_chatterbox_gpt2_config()
 
-    from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
-    print("Downloading Chatterbox Turbo weights...")
-    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
+    if model_dir is None:
+        # Use default cache location - user must have downloaded beforehand
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+        print("Initializing ChatterboxTurboTTS to locate model files...")
+        tts = ChatterboxTurboTTS.from_pretrained("cpu")
+        # Get the model directory from the instance
+        import chatterbox
+        import os
+        model_dir = Path(os.path.dirname(chatterbox.__file__)) / "models" / "chatterbox-turbo"
+        if not model_dir.exists():
+            raise RuntimeError(f"Model directory not found at {model_dir}. Please ensure chatterbox-turbo is installed.")
+    
+    model_dir = Path(model_dir)
     print(f"  Model dir: {model_dir}")
 
     print("  Loading T3 (GPT-2 Medium turbo)...")
@@ -285,22 +298,33 @@ def load_pytorch_model(cache_dir=None):
     return ChatterboxModels(t3=t3, s3gen=s3gen, model_dir=model_dir)
 
 
-def load_pytorch_model_v4(cache_dir=None):
+def load_pytorch_model_v4(model_dir=None):
     """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained.
 
     This matches the v4 HF artifacts (meanflow-trained s3gen). v4 stages
     (prefill, lm-onnx, cond-decoder) should use this loader.
+    
+    Args:
+        model_dir: Optional path to local model directory. If None, uses default cache.
     """
     _ensure_chatterbox_gpt2_config()
 
     print("Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('cpu')...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
-    from huggingface_hub import snapshot_download
 
     tts = ChatterboxTurboTTS.from_pretrained("cpu")
     tts.t3.train(False)
     tts.s3gen.train(False)
-    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
+    
+    if model_dir is None:
+        # Get the model directory from the instance
+        import chatterbox
+        import os
+        model_dir = Path(os.path.dirname(chatterbox.__file__)) / "models" / "chatterbox-turbo"
+        if not model_dir.exists():
+            raise RuntimeError(f"Model directory not found at {model_dir}. Please ensure chatterbox-turbo is installed.")
+    
+    model_dir = Path(model_dir)
     print(f"  Model dir: {model_dir}")
     print("  Models loaded successfully.")
     return ChatterboxModels(t3=tts.t3, s3gen=tts.s3gen, model_dir=model_dir)
@@ -705,13 +729,25 @@ def extract_vocoder_weights(model, output_dir):
 # TOKENIZER + CONFIG EXTRACTION
 # ===========================================================================
 
-def extract_tokenizer_and_config(model, output_dir):
-    """Copy tokenizer files and create config.json."""
+def extract_tokenizer_and_config(model, output_dir, model_dir=None):
+    """Copy tokenizer files and create config.json.
+    
+    Args:
+        model: ChatterboxModels instance (provides model_dir)
+        output_dir: Output directory path
+        model_dir: Optional path to local model directory. If None, uses model.model_dir.
+    """
     print("\n=== Extracting Tokenizer + Config ===")
 
-    # Find the cached model directory
-    from huggingface_hub import snapshot_download
-    model_dir = snapshot_download("ResembleAI/chatterbox-turbo")
+    # Use provided model_dir or fall back to model's model_dir
+    if model_dir is None:
+        model_dir = model.model_dir
+    
+    if model_dir is None:
+        raise RuntimeError("No model_dir provided and model doesn't have one. Please provide model_dir argument.")
+    
+    model_dir = Path(model_dir)
+    print(f"  Model dir: {model_dir}")
 
     # Copy tokenizer files
     tokenizer_files = ["tokenizer.json", "vocab.json", "merges.txt"]
