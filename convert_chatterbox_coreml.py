@@ -31,7 +31,6 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import coremltools as ct
 from safetensors.torch import save_file as save_safetensors
 
 
