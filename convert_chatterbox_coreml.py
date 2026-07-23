@@ -32,13 +32,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# Import coremltools conditionally - only needed for CoreML stages
-try:
-    import coremltools as ct
-except ImportError:
-    ct = None
-    print("Note: coremltools not available. CoreML conversion stages will be unavailable, but ONNX export will work.")
-
 from safetensors.torch import save_file as save_safetensors
 
 
