@@ -1,1 +1,1 @@
-Nothing should be ignored based on the provided file changes. The only modified file is `export_t3_onnx.py`, which is a Python source file and should not be added to .gitignore. Since there are no build artifacts, dependencies, temporary files, or other items that should be ignored in the changes, the .gitignore remains empty.
+Nothing should be ignored since only a Python source file (`export_t3_onnx.py`) was modified and there are no build artifacts, dependencies, or temporary files in the changes.
