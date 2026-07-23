@@ -281,7 +281,7 @@ def load_pytorch_model(model_path=None):
     t3_state = load_file(model_dir / "t3_turbo_v1.safetensors")
     
     # Handle vocab size mismatch: checkpoint has 52260 but model expects 50276
-    # Slice the text_emb and text_head (or speech_head) weights to match
+    # Slice the text_emb and speech_head weights to match
     expected_vocab = 50276
     checkpoint_vocab = 52260
     
@@ -296,6 +296,16 @@ def load_pytorch_model(model_path=None):
         if t3_state["tfmr.wte.weight"].shape[0] == checkpoint_vocab:
             print(f"  Adjusting tfmr.wte.weight vocab size from {checkpoint_vocab} to {expected_vocab}...")
             t3_state["tfmr.wte.weight"] = t3_state["tfmr.wte.weight"][:expected_vocab, :]
+    
+    # Also slice speech_head.weight if it has the larger vocab size
+    if "speech_head.weight" in t3_state and t3_state["speech_head.weight"].shape[0] == checkpoint_vocab:
+        print(f"  Adjusting speech_head.weight vocab size from {checkpoint_vocab} to {expected_vocab}...")
+        t3_state["speech_head.weight"] = t3_state["speech_head.weight"][:expected_vocab, :]
+    
+    # Also slice text_head.weight if it has the larger vocab size
+    if "text_head.weight" in t3_state and t3_state["text_head.weight"].shape[0] == checkpoint_vocab:
+        print(f"  Adjusting text_head.weight vocab size from {checkpoint_vocab} to {expected_vocab}...")
+        t3_state["text_head.weight"] = t3_state["text_head.weight"][:expected_vocab, :]
     
     # Load with strict=False to ignore missing keys like tfmr.wte.weight if it doesn't exist
     t3.load_state_dict(t3_state, strict=False)
