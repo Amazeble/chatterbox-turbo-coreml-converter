@@ -241,20 +241,26 @@ class ChatterboxModels:
         self.model_dir = model_dir
 
 
-def load_pytorch_model(cache_dir=None):
-    """Download and load the Chatterbox Turbo PyTorch model components (v1 path).
+def load_pytorch_model(model_path=None):
+    """Load the Chatterbox Turbo PyTorch model components (v1 path) from local directory.
 
-    Uses YAML config + manual state_dict load. v4 stages should use
-    load_pytorch_model_v4() which goes through ChatterboxTurboTTS.from_pretrained
-    for the meanflow-trained s3gen weights.
+    Uses YAML config + manual state_dict load. Requires a local model path.
+    
+    Args:
+        model_path: Required local path to model directory.
     """
     _ensure_chatterbox_gpt2_config()
 
-    from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
-    print("Downloading Chatterbox Turbo weights...")
-    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
+    if model_path is None:
+        raise ValueError("model_path is required. Use --model-path to specify local model directory.")
+    
+    model_dir = Path(model_path)
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+    
+    print(f"Loading Chatterbox Turbo from local path: {model_path}...")
     print(f"  Model dir: {model_dir}")
 
     print("  Loading T3 (GPT-2 Medium turbo)...")
@@ -286,32 +292,27 @@ def load_pytorch_model(cache_dir=None):
     return ChatterboxModels(t3=t3, s3gen=s3gen, model_dir=model_dir)
 
 
-def load_pytorch_model_v4(cache_dir=None, model_path=None):
+def load_pytorch_model_v4(model_path=None):
     """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained.
 
     This matches the v4 HF artifacts (meanflow-trained s3gen). v4 stages
     (prefill, lm-onnx, cond-decoder) should use this loader.
     
     Args:
-        cache_dir: Optional cache directory for HuggingFace downloads
-        model_path: Optional local path to model directory. If provided,
-                    loads from local path instead of downloading.
+        model_path: Required local path to model directory.
     """
     _ensure_chatterbox_gpt2_config()
 
     from chatterbox.tts_turbo import ChatterboxTurboTTS
-    from huggingface_hub import snapshot_download
 
-    if model_path is not None:
-        print(f"Loading Chatterbox Turbo from local path: {model_path}...")
-        model_dir = Path(model_path)
-        if not model_dir.exists():
-            raise FileNotFoundError(f"Model path does not exist: {model_path}")
-        tts = ChatterboxTurboTTS.from_pretrained(str(model_dir), local_files_only=True)
-    else:
-        print("Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('cpu')...")
-        tts = ChatterboxTurboTTS.from_pretrained("cpu")
-        model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
+    if model_path is None:
+        raise ValueError("model_path is required. Use --model-path to specify local model directory.")
+    
+    print(f"Loading Chatterbox Turbo from local path: {model_path}...")
+    model_dir = Path(model_path)
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+    tts = ChatterboxTurboTTS.from_pretrained(str(model_dir), local_files_only=True)
     
     tts.t3.train(False)
     tts.s3gen.train(False)
@@ -825,9 +826,8 @@ def extract_tokenizer_and_config(model, output_dir):
     """Copy tokenizer files and create config.json."""
     print("\n=== Extracting Tokenizer + Config ===")
 
-    # Find the cached model directory
-    from huggingface_hub import snapshot_download
-    model_dir = snapshot_download("ResembleAI/chatterbox-turbo")
+    # Use model_dir from the loaded model object
+    model_dir = model.model_dir
 
     # Copy tokenizer files
     tokenizer_files = ["tokenizer.json", "vocab.json", "merges.txt"]
@@ -2870,32 +2870,11 @@ def main():
     parser.add_argument(
         "--model-path",
         type=str,
-        default=None,
+        required=True,
         help=(
-            "Optional local path to a Chatterbox model directory containing "
-            "safetensors weights. If provided, loads the model from this local "
-            "path instead of downloading from HuggingFace. Useful for offline "
-            "conversion or when you already have the model cached locally."
-        ),
-    )
-    parser.add_argument(
-        "--weight",
-        type=str,
-        default=None,
-        help=(
-            "Local model directory path (alias for --model-path). "
-            "If provided, loads the model from this local path instead of "
-            "downloading from HuggingFace."
-        ),
-    )
-    parser.add_argument(
-        "--pretrain-model",
-        type=str,
-        default=None,
-        help=(
-            "Path to pre-trained model directory. If provided, loads the model "
-            "from this local path instead of downloading from HuggingFace. "
-            "This is useful when you have pre-trained weights stored locally."
+            "Local path to a Chatterbox model directory containing "
+            "safetensors weights. Loads the model from this local "
+            "path instead of downloading from HuggingFace."
         ),
     )
     args = parser.parse_args()
@@ -2913,11 +2892,11 @@ def main():
     v1_model = None
     v4_model = None
 
-    # Use --pretrain-model if provided, otherwise --weight, otherwise fall back to --model-path
-    model_path = args.pretrain_model or args.weight or args.model_path
+    # Use --model-path (only argument now)
+    model_path = args.model_path
 
     if is_v1:
-        v1_model = load_pytorch_model()
+        v1_model = load_pytorch_model(model_path=model_path)
     if is_v4:
         v4_model = load_pytorch_model_v4(model_path=model_path)
 
