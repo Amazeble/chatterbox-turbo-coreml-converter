@@ -279,7 +279,26 @@ def load_pytorch_model(model_path=None):
 
     t3 = T3(hp=turbo_cfg)
     t3_state = load_file(model_dir / "t3_turbo_v1.safetensors")
-    t3.load_state_dict(t3_state)
+    
+    # Handle vocab size mismatch: checkpoint has 52260 but model expects 50276
+    # Slice the text_emb and text_head (or speech_head) weights to match
+    expected_vocab = 50276
+    checkpoint_vocab = 52260
+    
+    # Check if we need to adjust embeddings
+    if "text_emb.weight" in t3_state and t3_state["text_emb.weight"].shape[0] == checkpoint_vocab:
+        print(f"  Adjusting vocab size from {checkpoint_vocab} to {expected_vocab}...")
+        # Slice text_emb.weight
+        t3_state["text_emb.weight"] = t3_state["text_emb.weight"][:expected_vocab, :]
+        
+    # Also check for tfmr.wte.weight which might exist in some checkpoints
+    if "tfmr.wte.weight" in t3_state:
+        if t3_state["tfmr.wte.weight"].shape[0] == checkpoint_vocab:
+            print(f"  Adjusting tfmr.wte.weight vocab size from {checkpoint_vocab} to {expected_vocab}...")
+            t3_state["tfmr.wte.weight"] = t3_state["tfmr.wte.weight"][:expected_vocab, :]
+    
+    # Load with strict=False to ignore missing keys like tfmr.wte.weight if it doesn't exist
+    t3.load_state_dict(t3_state, strict=False)
     t3.to("cpu").train(False)
 
     print("  Loading S3Gen...")
