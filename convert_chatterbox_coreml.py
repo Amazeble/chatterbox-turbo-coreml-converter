@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Convert Chatterbox Turbo TTS models to TorchScript format.
+Convert Chatterbox Turbo TTS models to CoreML format.
 
-Produces TorchScript models:
-  - T3Prefill.pt      — GPT-2 prefill
-  - T3Decode.pt       — GPT-2 single-step decode
-  - S3Encoder.pt      — Conformer encoder
-  - S3UNet.pt         — U-Net denoiser
+Produces three CoreML models:
+  - T3Prefill.mlpackage  — GPT-2 prefill (GPU)
+  - T3Decode.mlpackage   — GPT-2 single-step decode (GPU)
+  - S3Encoder.mlpackage  — Conformer encoder (ANE)
+  - S3UNet.mlpackage     — U-Net denoiser (ANE)
 
-Plus vocoder weights and tokenizer files.
+Plus vocoder weights and tokenizer files for the Swift package.
 
 Usage:
-    python convert_chatterbox_torchscript.py --stage t3 --output-dir /tmp/chatterbox-ts
-    python convert_chatterbox_torchscript.py --stage s3 --output-dir /tmp/chatterbox-ts
-    python convert_chatterbox_torchscript.py --stage vocoder --output-dir /tmp/chatterbox-ts
-    python convert_chatterbox_torchscript.py --stage all --output-dir /tmp/chatterbox-ts [--validate]
+    python convert_chatterbox_coreml.py --stage t3 --output-dir /tmp/chatterbox-coreml
+    python convert_chatterbox_coreml.py --stage s3 --output-dir /tmp/chatterbox-coreml
+    python convert_chatterbox_coreml.py --stage vocoder --output-dir /tmp/chatterbox-coreml
+    python convert_chatterbox_coreml.py --stage all --output-dir /tmp/chatterbox-coreml [--validate]
 """
 
 import argparse
@@ -31,6 +31,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import coremltools as ct
 from safetensors.torch import save_file as save_safetensors
 
 
@@ -101,7 +102,7 @@ def _ensure_chatterbox_gpt2_config():
 
 
 class SliceUpdateKeyValueCache:
-    """Seq-first 2D KV cache with dim-0 slice writes for TorchScript.
+    """Seq-first 2D KV cache with dim-0 slice writes for CoreML StateType.
 
     Layout: keyCache/valueCache are (max_seq, n_layers * n_heads * head_dim).
     Sequence dimension is dim 0 — the ONLY dimension CoreML runtime supports
@@ -240,33 +241,20 @@ class ChatterboxModels:
         self.model_dir = model_dir
 
 
-def load_pytorch_model(model_dir=None):
-    """Load the Chatterbox Turbo PyTorch model components (v1 path).
+def load_pytorch_model(cache_dir=None):
+    """Download and load the Chatterbox Turbo PyTorch model components (v1 path).
 
     Uses YAML config + manual state_dict load. v4 stages should use
     load_pytorch_model_v4() which goes through ChatterboxTurboTTS.from_pretrained
     for the meanflow-trained s3gen weights.
-    
-    Args:
-        model_dir: Optional path to local model directory. If None, uses default cache.
     """
     _ensure_chatterbox_gpt2_config()
 
+    from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
-    if model_dir is None:
-        # Use default cache location - user must have downloaded beforehand
-        from chatterbox.tts_turbo import ChatterboxTurboTTS
-        print("Initializing ChatterboxTurboTTS to locate model files...")
-        tts = ChatterboxTurboTTS.from_pretrained("cpu")
-        # Get the model directory from the instance
-        import chatterbox
-        import os
-        model_dir = Path(os.path.dirname(chatterbox.__file__)) / "models" / "chatterbox-turbo"
-        if not model_dir.exists():
-            raise RuntimeError(f"Model directory not found at {model_dir}. Please ensure chatterbox-turbo is installed.")
-    
-    model_dir = Path(model_dir)
+    print("Downloading Chatterbox Turbo weights...")
+    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
     print(f"  Model dir: {model_dir}")
 
     print("  Loading T3 (GPT-2 Medium turbo)...")
@@ -298,33 +286,22 @@ def load_pytorch_model(model_dir=None):
     return ChatterboxModels(t3=t3, s3gen=s3gen, model_dir=model_dir)
 
 
-def load_pytorch_model_v4(model_dir=None):
+def load_pytorch_model_v4(cache_dir=None):
     """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained.
 
     This matches the v4 HF artifacts (meanflow-trained s3gen). v4 stages
     (prefill, lm-onnx, cond-decoder) should use this loader.
-    
-    Args:
-        model_dir: Optional path to local model directory. If None, uses default cache.
     """
     _ensure_chatterbox_gpt2_config()
 
     print("Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('cpu')...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
+    from huggingface_hub import snapshot_download
 
     tts = ChatterboxTurboTTS.from_pretrained("cpu")
     tts.t3.train(False)
     tts.s3gen.train(False)
-    
-    if model_dir is None:
-        # Get the model directory from the instance
-        import chatterbox
-        import os
-        model_dir = Path(os.path.dirname(chatterbox.__file__)) / "models" / "chatterbox-turbo"
-        if not model_dir.exists():
-            raise RuntimeError(f"Model directory not found at {model_dir}. Please ensure chatterbox-turbo is installed.")
-    
-    model_dir = Path(model_dir)
+    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
     print(f"  Model dir: {model_dir}")
     print("  Models loaded successfully.")
     return ChatterboxModels(t3=tts.t3, s3gen=tts.s3gen, model_dir=model_dir)
@@ -339,7 +316,7 @@ CONTEXT_SIZE = 2048  # Max sequence length for KV cache state
 
 
 class T3StatefulWrapper(nn.Module):
-    """Stateful T3 wrapper for TorchScript: takes pre-computed embeddings, not token IDs.
+    """Stateful T3 wrapper for CoreML: takes pre-computed embeddings, not token IDs.
 
     The embedding lookup and speaker conditioning happen in Swift.
     This model is JUST: transformer + speech_head + KV cache state.
@@ -392,7 +369,7 @@ class T3StatefulWrapper(nn.Module):
 
 
 def convert_t3(model, output_dir, validate=False):
-    """Convert T3 to a single stateful TorchScript model with KV cache."""
+    """Convert T3 to a single stateful CoreML model with StateType KV cache."""
     print("\n=== Converting T3 Stateful (GPT-2 + KV Cache) ===")
 
     t3_model = model
@@ -438,26 +415,77 @@ def convert_t3(model, output_dir, validate=False):
     # Restore original forward
     GPT2Attention.forward = original_forward
 
-    # Save as TorchScript
-    out_path = os.path.join(output_dir, "T3Stateful.pt")
-    traced.save(out_path)
+    # StateType for 2D seq-first KV cache
+    feature_size = GPT2_LAYERS * GPT2_HEADS * GPT2_HEAD_DIM  # 24 * 16 * 64 = 24576
+    cache_shape = (CONTEXT_SIZE, feature_size)
+    states = [
+        ct.StateType(
+            wrapped_type=ct.TensorType(shape=cache_shape, dtype=np.float16),
+            name="keyCache",
+        ),
+        ct.StateType(
+            wrapped_type=ct.TensorType(shape=cache_shape, dtype=np.float16),
+            name="valueCache",
+        ),
+    ]
+
+    # Fixed decode shape: seq=1 token + 1 conditioning = 2 positions.
+    # EnumeratedShapes and RangeDim both cause error -14 with stateful models.
+    # Prefill is done token-by-token through the same fixed-shape model.
+    print("  Converting with fixed decode shape (seq=1, pos=2)...")
+
+    mlmodel = ct.convert(
+        traced,
+        inputs=[
+            ct.TensorType(name="inputs_embeds", shape=(1, 1, GPT2_HIDDEN), dtype=np.float32),
+            ct.TensorType(name="position_ids", shape=(1, 1), dtype=np.int32),
+            ct.TensorType(name="cache_position", shape=(1,), dtype=np.int32),
+            ct.TensorType(name="attention_mask", shape=(1, 1, 1, CONTEXT_SIZE), dtype=np.float32),
+        ],
+        outputs=[ct.TensorType(name="logits", dtype=np.float16)],
+        states=states,
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    out_path = os.path.join(output_dir, "T3Stateful.mlpackage")
+    mlmodel.save(out_path)
     print(f"  Saved: {out_path}")
+
+    # Check for state ops in MIL program
+    from coremltools.converters.mil.testing_utils import get_op_types_in_program
+    ops = get_op_types_in_program(mlmodel._mil_program)
+    has_state = "coreml_update_state" in ops
+    print(f"  State ops present: {has_state}")
+    if not has_state:
+        print("  WARNING: No coreml_update_state — KV cache may not work!")
 
     if validate:
         validate_t3_stateful(t3_model, out_path)
 
 
 def validate_t3_stateful(pytorch_model, model_path):
-    """Validate stateful T3 TorchScript output matches PyTorch."""
+    """Validate stateful T3 CoreML output matches PyTorch."""
     print("\n  --- T3 Stateful Numerical Validation ---")
 
-    # Load TorchScript model
-    ts_model = torch.jit.load(model_path)
-    ts_model.eval()
+    # Save and reload to get CoreML framework backend (needed for make_state).
+    # The convert() output uses coremltools internal backend which can't make_state().
+    # CPU_ONLY avoids error -14 from ANE compilation of dynamic shapes.
+    import tempfile, shutil
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = os.path.join(tmpdir, "T3Stateful.mlpackage")
+        shutil.copytree(model_path, tmp_path)
+        ml_model = ct.models.MLModel(tmp_path, compute_units=ct.ComputeUnit.CPU_ONLY)
 
-    # Token-by-token prefill
+    state = ml_model.make_state()
+
+    # Token-by-token prefill (fixed shape model only accepts seq=1)
+    # Each call processes 1 speech token + 1 conditioning token = 2 positions
     import time
     prefill_ids = np.random.randint(0, SPEECH_VOCAB_SIZE, (16,)).astype(np.int32)
+    prefill_spk = np.random.randn(1, SPEAKER_EMB_DIM).astype(np.float32)
+    zero_spk = np.zeros((1, SPEAKER_EMB_DIM), dtype=np.float32)
 
     # Load speech embedding table for lookups
     speech_emb_table = pytorch_model.t3.speech_emb.weight.data.cpu().numpy()  # (vocab, 1024)
@@ -473,46 +501,39 @@ def validate_t3_stateful(pytorch_model, model_path):
 
     t0 = time.time()
     # Position 0: conditioning
-    with torch.no_grad():
-        ts_model(
-            torch.from_numpy(cond_emb),
-            torch.tensor([[0]], dtype=torch.int32),
-            torch.tensor([0], dtype=torch.int32),
-            torch.zeros(1, 1, 1, CONTEXT_SIZE, dtype=torch.float32),
-        )
+    ml_model.predict(
+        {"inputs_embeds": cond_emb, "position_ids": np.array([[0]], dtype=np.int32),
+         "cache_position": np.array([0], dtype=np.int32)},
+        state=state,
+    )
     # Positions 1-16: speech tokens
     for i in range(16):
         emb = speech_emb_table[prefill_ids[i]].reshape(1, 1, GPT2_HIDDEN).astype(np.float32)
-        pos = torch.tensor([[i + 1]], dtype=torch.int32)
-        cp = torch.tensor([i + 1], dtype=torch.int32)
-        mask = torch.zeros(1, 1, 1, CONTEXT_SIZE, dtype=torch.float32)
-        mask[:, :, :, :i+2] = 0.0  # valid positions
-        mask[:, :, :, i+2:] = -1e9  # unfilled positions
-        with torch.no_grad():
-            ts_model(torch.from_numpy(emb), pos, cp, mask)
+        pos = np.array([[i + 1]], dtype=np.int32)
+        cp = np.array([i + 1], dtype=np.int32)
+        ml_model.predict(
+            {"inputs_embeds": emb, "position_ids": pos, "cache_position": cp},
+            state=state,
+        )
     prefill_ms = (time.time() - t0) * 1000
     print(f"  Prefill (1 cond + 16 tokens): {prefill_ms:.0f}ms ({prefill_ms/17:.1f}ms/tok)")
 
     # Decode step 1
     decode_emb = speech_emb_table[42].reshape(1, 1, GPT2_HIDDEN).astype(np.float32)
-    with torch.no_grad():
-        cm_d1 = ts_model(
-            torch.from_numpy(decode_emb),
-            torch.tensor([[17]], dtype=torch.int32),
-            torch.tensor([17], dtype=torch.int32),
-            torch.zeros(1, 1, 1, CONTEXT_SIZE, dtype=torch.float32),
-        )
+    cm_d1 = ml_model.predict(
+        {"inputs_embeds": decode_emb, "position_ids": np.array([[17]], dtype=np.int32),
+         "cache_position": np.array([17], dtype=np.int32)},
+        state=state,
+    )
 
     # Decode step 2
-    with torch.no_grad():
-        cm_d2 = ts_model(
-            torch.from_numpy(decode_emb),
-            torch.tensor([[18]], dtype=torch.int32),
-            torch.tensor([18], dtype=torch.int32),
-            torch.zeros(1, 1, 1, CONTEXT_SIZE, dtype=torch.float32),
-        )
+    cm_d2 = ml_model.predict(
+        {"inputs_embeds": decode_emb, "position_ids": np.array([[18]], dtype=np.int32),
+         "cache_position": np.array([18], dtype=np.int32)},
+        state=state,
+    )
 
-    diff = torch.abs(cm_d1 - cm_d2).max().item()
+    diff = np.abs(cm_d1["logits"] - cm_d2["logits"]).max()
     print(f"  Decode step diff: {diff:.4f}")
     if diff > 0.001:
         print("  PASS: KV cache working across decode steps!")
@@ -589,7 +610,7 @@ class S3UNetWrapper(nn.Module):
 
 
 def convert_s3(model, output_dir, validate=False):
-    """Convert S3Encoder and S3UNet to TorchScript."""
+    """Convert S3Encoder and S3UNet to CoreML."""
     print("\n=== Converting S3Encoder (Conformer) ===")
 
     s3gen = model.s3gen
@@ -611,9 +632,26 @@ def convert_s3(model, output_dir, validate=False):
     with torch.no_grad():
         traced_encoder = torch.jit.trace(encoder_wrapper, (example_tokens,))
 
-    # Save as TorchScript
-    encoder_path = os.path.join(output_dir, "S3Encoder.pt")
-    traced_encoder.save(encoder_path)
+    print("  Converting S3Encoder to CoreML...")
+    encoder_inputs = [
+        ct.TensorType(
+            name="all_tokens",
+            shape=ct.Shape(shape=(1, ct.RangeDim(lower_bound=1, upper_bound=2048, default=70))),
+            dtype=np.int32,
+        ),
+    ]
+
+    encoder_coreml = ct.convert(
+        traced_encoder,
+        inputs=encoder_inputs,
+        outputs=[ct.TensorType(name="encoder_proj", dtype=np.float16)],
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    encoder_path = os.path.join(output_dir, "S3Encoder.mlpackage")
+    encoder_coreml.save(encoder_path)
     print(f"  Saved: {encoder_path}")
 
     # --- S3UNet ---
@@ -638,9 +676,29 @@ def convert_s3(model, output_dir, validate=False):
              example_spks, example_cond, example_r),
         )
 
-    # Save as TorchScript
-    unet_path = os.path.join(output_dir, "S3UNet.pt")
-    traced_unet.save(unet_path)
+    print("  Converting S3UNet to CoreML...")
+    T_dim = ct.RangeDim(lower_bound=1, upper_bound=4096, default=100)
+    unet_inputs = [
+        ct.TensorType(name="x", shape=ct.Shape(shape=(1, MEL_BINS, T_dim)), dtype=np.float32),
+        ct.TensorType(name="mu", shape=ct.Shape(shape=(1, MEL_BINS, T_dim)), dtype=np.float32),
+        ct.TensorType(name="mask", shape=ct.Shape(shape=(1, 1, T_dim)), dtype=np.float32),
+        ct.TensorType(name="t", shape=(1,), dtype=np.float32),
+        ct.TensorType(name="spks", shape=(1, CAMPP_EMB_DIM), dtype=np.float32),
+        ct.TensorType(name="cond", shape=ct.Shape(shape=(1, MEL_BINS, T_dim)), dtype=np.float32),
+        ct.TensorType(name="r", shape=(1,), dtype=np.float32),
+    ]
+
+    unet_coreml = ct.convert(
+        traced_unet,
+        inputs=unet_inputs,
+        outputs=[ct.TensorType(name="velocity", dtype=np.float16)],
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.ALL,
+        minimum_deployment_target=ct.target.iOS18,
+    )
+
+    unet_path = os.path.join(output_dir, "S3UNet.mlpackage")
+    unet_coreml.save(unet_path)
     print(f"  Saved: {unet_path}")
 
     # Restore monkey-patched view_as
@@ -651,12 +709,11 @@ def convert_s3(model, output_dir, validate=False):
 
 
 def validate_s3(s3_flow, encoder_path, unet_path):
-    """Validate S3 TorchScript outputs match PyTorch."""
+    """Validate S3 CoreML outputs match PyTorch."""
     print("\n  --- S3 Numerical Validation ---")
 
-    # Load TorchScript models
-    encoder_ts = torch.jit.load(encoder_path)
-    unet_ts = torch.jit.load(unet_path)
+    encoder_ml = ct.models.MLModel(encoder_path)
+    unet_ml = ct.models.MLModel(unet_path)
 
     # Test encoder
     test_tokens = torch.randint(0, SPEECH_VOCAB_SIZE, (1, 40), dtype=torch.long)
@@ -664,11 +721,15 @@ def validate_s3(s3_flow, encoder_path, unet_path):
     encoder_wrapper = S3EncoderWrapper(s3_flow)
     with torch.no_grad():
         pt_mu = encoder_wrapper(test_tokens)
-        ts_mu = encoder_ts(test_tokens)
+
+    cm_out = encoder_ml.predict({
+        "all_tokens": test_tokens.int().numpy(),
+    })
+    cm_mu = torch.from_numpy(cm_out["encoder_proj"]).float()
 
     cos_sim = torch.nn.functional.cosine_similarity(
         pt_mu.flatten().unsqueeze(0),
-        ts_mu.flatten().unsqueeze(0)
+        cm_mu.flatten().unsqueeze(0)
     ).item()
     print(f"  S3Encoder cosine similarity: {cos_sim:.6f}")
     if cos_sim >= 0.99:
@@ -690,11 +751,21 @@ def validate_s3(s3_flow, encoder_path, unet_path):
     unet_wrapper.eval()
     with torch.no_grad():
         pt_vel = unet_wrapper(test_x, test_mu_in, test_mask, test_t, test_spks, test_cond, test_r)
-        ts_vel = unet_ts(test_x, test_mu_in, test_mask, test_t, test_spks, test_cond, test_r)
+
+    cm_out = unet_ml.predict({
+        "x": test_x.numpy(),
+        "mu": test_mu_in.numpy(),
+        "mask": test_mask.numpy(),
+        "t": test_t.numpy(),
+        "spks": test_spks.numpy(),
+        "cond": test_cond.numpy(),
+        "r": test_r.numpy(),
+    })
+    cm_vel = torch.from_numpy(cm_out["velocity"]).float()
 
     cos_sim = torch.nn.functional.cosine_similarity(
         pt_vel.flatten().unsqueeze(0),
-        ts_vel.flatten().unsqueeze(0)
+        cm_vel.flatten().unsqueeze(0)
     ).item()
     print(f"  S3UNet cosine similarity: {cos_sim:.6f}")
     if cos_sim >= 0.99:
@@ -729,25 +800,13 @@ def extract_vocoder_weights(model, output_dir):
 # TOKENIZER + CONFIG EXTRACTION
 # ===========================================================================
 
-def extract_tokenizer_and_config(model, output_dir, model_dir=None):
-    """Copy tokenizer files and create config.json.
-    
-    Args:
-        model: ChatterboxModels instance (provides model_dir)
-        output_dir: Output directory path
-        model_dir: Optional path to local model directory. If None, uses model.model_dir.
-    """
+def extract_tokenizer_and_config(model, output_dir):
+    """Copy tokenizer files and create config.json."""
     print("\n=== Extracting Tokenizer + Config ===")
 
-    # Use provided model_dir or fall back to model's model_dir
-    if model_dir is None:
-        model_dir = model.model_dir
-    
-    if model_dir is None:
-        raise RuntimeError("No model_dir provided and model doesn't have one. Please provide model_dir argument.")
-    
-    model_dir = Path(model_dir)
-    print(f"  Model dir: {model_dir}")
+    # Find the cached model directory
+    from huggingface_hub import snapshot_download
+    model_dir = snapshot_download("ResembleAI/chatterbox-turbo")
 
     # Copy tokenizer files
     tokenizer_files = ["tokenizer.json", "vocab.json", "merges.txt"]
