@@ -211,7 +211,8 @@ def export_onnx(model, output_path, seq_len=128):
             'input_ids': {0: 'batch', 1: 'sequence'},
             'logits': {0: 'batch', 1: 'sequence'}
         },
-        verbose=False
+        verbose=False,
+        dynamo=False
     )
     print(f"Saved raw ONNX to {output_path}")
 
