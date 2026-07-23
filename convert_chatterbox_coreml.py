@@ -2878,6 +2878,16 @@ def main():
             "conversion or when you already have the model cached locally."
         ),
     )
+    parser.add_argument(
+        "--weight",
+        type=str,
+        default=None,
+        help=(
+            "Local model directory path (alias for --model-path). "
+            "If provided, loads the model from this local path instead of "
+            "downloading from HuggingFace."
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -2893,10 +2903,13 @@ def main():
     v1_model = None
     v4_model = None
 
+    # Use --weight if provided, otherwise fall back to --model-path
+    model_path = args.weight if args.weight is not None else args.model_path
+
     if is_v1:
         v1_model = load_pytorch_model()
     if is_v4:
-        v4_model = load_pytorch_model_v4()
+        v4_model = load_pytorch_model_v4(model_path=model_path)
 
     # --- v1 stages ---
     if args.stage in ("t3", "all"):
