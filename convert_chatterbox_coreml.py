@@ -2888,6 +2888,16 @@ def main():
             "downloading from HuggingFace."
         ),
     )
+    parser.add_argument(
+        "--pretrain-model",
+        type=str,
+        default=None,
+        help=(
+            "Path to pre-trained model directory. If provided, loads the model "
+            "from this local path instead of downloading from HuggingFace. "
+            "This is useful when you have pre-trained weights stored locally."
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -2903,8 +2913,8 @@ def main():
     v1_model = None
     v4_model = None
 
-    # Use --weight if provided, otherwise fall back to --model-path
-    model_path = args.weight if args.weight is not None else args.model_path
+    # Use --pretrain-model if provided, otherwise --weight, otherwise fall back to --model-path
+    model_path = args.pretrain_model or args.weight or args.model_path
 
     if is_v1:
         v1_model = load_pytorch_model()
