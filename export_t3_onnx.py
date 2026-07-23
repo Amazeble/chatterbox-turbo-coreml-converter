@@ -101,7 +101,8 @@ class T3Model(nn.Module):
     def forward(self, idx):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
+        # Assert removed to enable ONNX constant folding
+        # assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         
         # Use fixed positional indices instead of dynamic arange
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
