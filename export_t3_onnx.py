@@ -80,6 +80,7 @@ class T3Model(nn.Module):
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
+        self.block_size = block_size
         
         self.wte = nn.Embedding(vocab_size, n_embd)
         self.wpe = nn.Embedding(block_size, n_embd)
@@ -90,12 +91,19 @@ class T3Model(nn.Module):
         
         self.ln_f = nn.LayerNorm(n_embd)
         self.text_head = nn.Linear(n_embd, vocab_size, bias=False)
+        
+        # Register causal mask as buffer to avoid dynamic computation
+        self.register_buffer(
+            "causal_mask",
+            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size).bool()
+        )
 
     def forward(self, idx):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.wpe.weight.size(0), f"Cannot forward sequence of length {t}, block size is only {self.wpe.weight.size(0)}"
+        assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         
+        # Use fixed positional indices instead of dynamic arange
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
 
         tok_emb = self.wte(idx)
@@ -204,8 +212,11 @@ def export_onnx(model, output_path, seq_len=128):
     
     dummy_input = torch.randint(0, model.vocab_size, (1, seq_len), dtype=torch.long).to(device)
     
-    print(f"Exporting to ONNX (Opset 17)...")
+    print(f"Exporting to ONNX (Opset 17) with fixed sequence length {seq_len}...")
+    print("Note: Sequence length is fixed to enable constant folding. Dynamic sequence length causes Unsqueeze/Range ops that cannot be optimized.")
     
+    # Use fixed sequence length - do NOT make sequence dimension dynamic
+    # This allows onnx-simplifier to fold Range/Unsqueeze/Gather operations
     torch.onnx.export(
         model,
         dummy_input,
@@ -216,8 +227,8 @@ def export_onnx(model, output_path, seq_len=128):
         input_names=['input_ids'],
         output_names=['logits'],
         dynamic_axes={
-            'input_ids': {0: 'batch', 1: 'sequence'},
-            'logits': {0: 'batch', 1: 'sequence'}
+            'input_ids': {0: 'batch'},  # Only batch is dynamic, sequence is fixed
+            'logits': {0: 'batch'}      # Only batch is dynamic, sequence is fixed
         },
         verbose=False,
         dynamo=False
