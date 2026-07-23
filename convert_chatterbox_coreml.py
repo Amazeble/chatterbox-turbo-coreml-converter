@@ -241,20 +241,24 @@ class ChatterboxModels:
         self.model_dir = model_dir
 
 
-def load_pytorch_model(cache_dir=None):
-    """Download and load the Chatterbox Turbo PyTorch model components (v1 path).
+def load_pytorch_model(model_dir):
+    """Load the Chatterbox Turbo PyTorch model components (v1 path) from local directory.
 
     Uses YAML config + manual state_dict load. v4 stages should use
     load_pytorch_model_v4() which goes through ChatterboxTurboTTS.from_pretrained
     for the meanflow-trained s3gen weights.
+    
+    Args:
+        model_dir: Path to local directory containing model files
     """
     _ensure_chatterbox_gpt2_config()
 
-    from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
-    print("Downloading Chatterbox Turbo weights...")
-    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
+    print(f"Loading Chatterbox Turbo weights from {model_dir}...")
+    model_dir = Path(model_dir)
+    if not model_dir.exists():
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
     print(f"  Model dir: {model_dir}")
 
     print("  Loading T3 (GPT-2 Medium turbo)...")
@@ -286,22 +290,24 @@ def load_pytorch_model(cache_dir=None):
     return ChatterboxModels(t3=t3, s3gen=s3gen, model_dir=model_dir)
 
 
-def load_pytorch_model_v4(cache_dir=None):
-    """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained.
+def load_pytorch_model_v4(model_dir):
+    """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained from local directory.
 
     This matches the v4 HF artifacts (meanflow-trained s3gen). v4 stages
     (prefill, lm-onnx, cond-decoder) should use this loader.
+    
+    Args:
+        model_dir: Path to local directory containing model files
     """
     _ensure_chatterbox_gpt2_config()
 
-    print("Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('cpu')...")
+    print(f"Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('{model_dir}')...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
-    from huggingface_hub import snapshot_download
 
-    tts = ChatterboxTurboTTS.from_pretrained("cpu")
+    tts = ChatterboxTurboTTS.from_pretrained(model_dir, device="cpu")
     tts.t3.train(False)
     tts.s3gen.train(False)
-    model_dir = Path(snapshot_download("ResembleAI/chatterbox-turbo"))
+    model_dir = Path(model_dir)
     print(f"  Model dir: {model_dir}")
     print("  Models loaded successfully.")
     return ChatterboxModels(t3=tts.t3, s3gen=tts.s3gen, model_dir=model_dir)
@@ -804,9 +810,8 @@ def extract_tokenizer_and_config(model, output_dir):
     """Copy tokenizer files and create config.json."""
     print("\n=== Extracting Tokenizer + Config ===")
 
-    # Find the cached model directory
-    from huggingface_hub import snapshot_download
-    model_dir = snapshot_download("ResembleAI/chatterbox-turbo")
+    # Use model_dir from the loaded model object
+    model_dir = model.model_dir
 
     # Copy tokenizer files
     tokenizer_files = ["tokenizer.json", "vocab.json", "merges.txt"]
@@ -2836,6 +2841,12 @@ def main():
             "(CoreML palettization is a separate path; not yet wired)."
         ),
     )
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        required=True,
+        help="Path to local directory containing model files (no HuggingFace download)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -2852,9 +2863,9 @@ def main():
     v4_model = None
 
     if is_v1:
-        v1_model = load_pytorch_model()
+        v1_model = load_pytorch_model(args.model_dir)
     if is_v4:
-        v4_model = load_pytorch_model_v4()
+        v4_model = load_pytorch_model_v4(args.model_dir)
 
     # --- v1 stages ---
     if args.stage in ("t3", "all"):
