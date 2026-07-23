@@ -263,7 +263,7 @@ def load_pytorch_model(model_dir):
     """Load the Chatterbox Turbo PyTorch model components (v1 path) from local directory.
 
     Uses YAML config + manual state_dict load. v4 stages should use
-    load_pytorch_model_v4() which goes through ChatterboxTurboTTS.from_pretrained
+    load_pytorch_model_v4() which goes through ChatterboxTurboTTS.from_local
     for the meanflow-trained s3gen weights.
     
     Args:
@@ -318,7 +318,7 @@ def load_pytorch_model(model_dir):
 
 
 def load_pytorch_model_v4(model_dir):
-    """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_pretrained from local directory.
+    """Load Chatterbox Turbo via the official ChatterboxTurboTTS.from_local from local directory.
 
     This matches the v4 HF artifacts (meanflow-trained s3gen). v4 stages
     (prefill, lm-onnx, cond-decoder) should use this loader.
@@ -328,10 +328,11 @@ def load_pytorch_model_v4(model_dir):
     """
     _ensure_chatterbox_gpt2_config()
 
-    print(f"Loading Chatterbox Turbo via ChatterboxTurboTTS.from_pretrained('{model_dir}')...")
+    print(f"Loading Chatterbox Turbo via ChatterboxTurboTTS.from_local('{model_dir}')...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-    tts = ChatterboxTurboTTS.from_pretrained(model_dir)
+    # Use from_local() directly with explicit CPU device to avoid device parsing issues
+    tts = ChatterboxTurboTTS.from_local(model_dir, device="cpu")
     tts.t3.train(False)
     tts.s3gen.train(False)
     model_dir = Path(model_dir)
