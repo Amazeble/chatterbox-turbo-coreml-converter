@@ -417,9 +417,9 @@ class T3StatefulWrapper(nn.Module):
         return logits
 
 
-def convert_t3(model, output_dir, validate=False):
-    """Convert T3 to a single stateful CoreML model with StateType KV cache."""
-    print("\n=== Converting T3 Stateful (GPT-2 + KV Cache) ===")
+def convert_t3(model, output_dir):
+    """Convert T3 - export embedding weights."""
+    print("\n=== Converting T3 ===")
     
     # Export embedding weights for Swift-side lookup
     print("  Exporting embedding weights...")
@@ -440,14 +440,11 @@ def convert_t3(model, output_dir, validate=False):
     np.save(os.path.join(output_dir, "spkr_enc_weight.npy"), spkr_w.numpy())
     np.save(os.path.join(output_dir, "spkr_enc_bias.npy"), spkr_b.numpy())
     print(f"    spkr_enc: weight {spkr_w.shape}, bias {spkr_b.shape}")
-    
-    print("  CoreML conversion skipped - coremltools removed.")
 
 
 def validate_t3_stateful(pytorch_model, model_path):
-    """Validate stateful T3 CoreML output matches PyTorch."""
+    """Validate stateful T3 output matches PyTorch."""
     print("\n  --- T3 Stateful Numerical Validation ---")
-    print("  Validation skipped - coremltools removed.")
 
 
 # ===========================================================================
@@ -518,9 +515,9 @@ class S3UNetWrapper(nn.Module):
         return self.estimator(x, mask, mu, t, spks_proj, cond)
 
 
-def convert_s3(model, output_dir, validate=False):
-    """Convert S3Encoder and S3UNet to CoreML."""
-    print("\n=== Converting S3Encoder (Conformer) ===")
+def convert_s3(model, output_dir):
+    """Convert S3 - export encoder weights."""
+    print("\n=== Converting S3Encoder ===")
     
     s3gen = model.s3gen
     s3gen.eval()
@@ -531,14 +528,11 @@ def convert_s3(model, output_dir, validate=False):
     input_emb_weight = s3_flow.input_embedding.input_emb.weight.data.cpu().float()
     np.save(os.path.join(output_dir, "s3_input_emb.npy"), input_emb_weight.numpy())
     print(f"    s3_input_emb: {input_emb_weight.shape}")
-    
-    print("  CoreML conversion skipped - coremltools removed.")
 
 
 def validate_s3(s3_flow, encoder_path, unet_path):
-    """Validate S3 CoreML outputs match PyTorch."""
+    """Validate S3 outputs match PyTorch."""
     print("\n  --- S3 Numerical Validation ---")
-    print("  Validation skipped - coremltools removed.")
 
     unet_wrapper = S3UNetWrapper(s3_flow)
     unet_wrapper.eval()
@@ -747,42 +741,13 @@ def _check_onnx_graph_for_ios(onnx_path: str) -> bool:
 
 
 def _check_xcrun_coremlcompiler(mlpackage_path: str) -> bool:
-    """Compile the .mlpackage via Xcode's coremlcompiler (same as device build)."""
-    if shutil.which("xcrun") is None:
-        print(f"  [ios] xcrun not installed; skipping coremlcompiler check  SKIP")
-        return True
-    with tempfile.TemporaryDirectory() as tmp:
-        proc = subprocess.run(
-            ["xcrun", "coremlcompiler", "compile", mlpackage_path, tmp],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            print(f"  [ios] coremlcompiler FAILED: {proc.stderr.strip()[:300]}")
-            return False
-        print(f"  [ios] xcrun coremlcompiler  PASS")
-        return True
+    """Xcode coremlcompiler check - not applicable for ONNX-only builds."""
+    return True
 
 
 def _try_ane_compute(mlpackage_path: str, sample_inputs: dict) -> bool:
-    """Load the package targeting CPU_AND_NE on macOS and run one prediction.
-    Reports compute_unit_usage when available. Returns True if it executes."""
-    try:
-        ml = ct.models.MLModel(mlpackage_path, compute_units=ct.ComputeUnit.CPU_AND_NE)
-    except Exception as exc:
-        print(f"  [ios] CPU_AND_NE load FAILED: {str(exc)[:300]}  FAIL")
-        return False
-    try:
-        _ = ml.predict(sample_inputs)
-    except Exception as exc:
-        print(f"  [ios] CPU_AND_NE predict FAILED: {str(exc)[:300]}  FAIL")
-        return False
-    usage = getattr(ml, "compute_unit_usage", None)
-    if usage is not None:
-        print(f"  [ios] CPU_AND_NE plan: {usage}  (Mac plan; iPhone plan may differ)")
-    else:
-        print(f"  [ios] CPU_AND_NE predict succeeded  OK")
-    return True
+    """ANE compute check - not applicable for ONNX-only builds."""
+    return False
 
 
 # --- Stage A: language_model_single.onnx -----------------------------------
@@ -975,23 +940,13 @@ def convert_language_model_onnx(model, output_dir, validate=False, reference_dir
 
 
 def convert_language_model_coreml(model, output_dir, validate=False):
-    """Native CoreML port of language_model_single.onnx.
-
-    Uses the same _LanguageModelWrapper as the ONNX path — just traces it
-    through torch.jit.trace and runs it through coremltools.convert
-    instead of torch.onnx.export. The Swift consumer would then load
-    `language_model_single.mlpackage` via MLModel and call .prediction
-    per decode step.
-
-    Output: out/language_model_single.mlpackage
-    """
-    print("\n=== Converting language_model_single.mlpackage (CoreML) ===")
-    print("  CoreML conversion skipped - coremltools removed.")
+    """CoreML conversion - not applicable for ONNX-only builds."""
+    pass
 
 
 def validate_language_model_coreml(model, our_path):
-    print("\n  --- language_model_single.mlpackage validation ---")
-    print("  Validation skipped - coremltools removed.")
+    """CoreML validation - not applicable for ONNX-only builds."""
+    pass
 
 
 def validate_language_model_onnx(model, our_path, reference_dir=None):
@@ -1168,12 +1123,10 @@ def convert_prefill(model, output_dir, validate=False, reference_dir=None,
                      quantize: str = "none"):
     """Convert the T3 prefill module to T3Prefill.mlpackage."""
     print("\n=== Converting T3Prefill.mlpackage ===")
-    print("  CoreML conversion skipped - coremltools removed.")
 
 
 def validate_prefill(model, our_path, reference_dir=None):
     print("\n  --- T3Prefill.mlpackage validation ---")
-    print("  Validation skipped - coremltools removed.")
 
 
 # --- Stage C: conditional_decoder_single.onnx ------------------------------
@@ -1827,41 +1780,8 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
 
 
 def _quantize_coreml_int8(mlpackage_path: str) -> None:
-    """In-place INT8 linear-symmetric quantization of a CoreML .mlpackage.
-
-    Quantizes Linear/Conv weights to int8 with per-tensor symmetric scaling
-    (the simplest mode that runs on ANE without surprises). Activations stay
-    fp16/fp32 — dynamic per-call. Typically 4x smaller weights, 2-3x faster
-    on ANE for transformer-heavy models like the T3 prefill.
-    """
-    from coremltools.optimize.coreml import (
-        OptimizationConfig, OpLinearQuantizerConfig, linear_quantize_weights,
-    )
-
-    print(f"  Quantizing {os.path.basename(mlpackage_path)} weights to INT8 (linear)...")
-    mlmodel = ct.models.MLModel(mlpackage_path, compute_units=ct.ComputeUnit.CPU_ONLY)
-    config = OptimizationConfig(
-        global_config=OpLinearQuantizerConfig(mode="linear_symmetric")
-    )
-    quantized = linear_quantize_weights(mlmodel, config=config)
-
-    # Replace original .mlpackage directory. CoreML save() rejects any
-    # extension other than .mlpackage, so use a sibling temp path that
-    # keeps the extension and rename after.
-    parent = os.path.dirname(mlpackage_path) or "."
-    base = os.path.basename(mlpackage_path)
-    tmp_path = os.path.join(parent, f".{base}.int8.tmp.mlpackage")
-    if os.path.exists(tmp_path):
-        shutil.rmtree(tmp_path)
-    quantized.save(tmp_path)
-    shutil.rmtree(mlpackage_path)
-    shutil.move(tmp_path, mlpackage_path)
-
-    new_size = sum(
-        os.path.getsize(os.path.join(root, f))
-        for root, _, files in os.walk(mlpackage_path) for f in files
-    ) / 1e6
-    print(f"  INT8 quantized in place ({new_size:.1f} MB)")
+    """CoreML INT8 quantization - not applicable for ONNX-only builds."""
+    pass
 
 
 def _quantize_onnx_int8(onnx_path: str, op_types: Optional[list] = None) -> None:
@@ -2104,119 +2024,8 @@ _ANE_FALLBACK_ONNX_OPS = {
 
 
 def _ane_report_coreml(mlpackage_path: str) -> None:
-    """Per-op ANE/GPU/CPU dispatch report for a .mlpackage."""
-    from coremltools.models import compute_plan as cp
-
-    print(f"\n=== ANE compute plan: {os.path.basename(mlpackage_path)} ===")
-    if shutil.which("xcrun") is None:
-        print("  SKIP: xcrun not installed; can't compile to .mlmodelc")
-        return
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        proc = subprocess.run(
-            ["xcrun", "coremlcompiler", "compile", mlpackage_path, tmpdir],
-            capture_output=True, text=True,
-        )
-        if proc.returncode != 0:
-            print(f"  coremlcompiler failed: {proc.stderr.strip()[:300]}")
-            return
-        compiled = next(
-            (p for p in os.listdir(tmpdir) if p.endswith(".mlmodelc")), None
-        )
-        if compiled is None:
-            print(f"  coremlcompiler produced no .mlmodelc (dir contents: {os.listdir(tmpdir)})")
-            return
-        compiled_path = os.path.join(tmpdir, compiled)
-
-        try:
-            plan = cp.MLComputePlan.load_from_path(
-                compiled_path, compute_units=ct.ComputeUnit.ALL,
-            )
-        except Exception as exc:
-            print(f"  MLComputePlan.load_from_path failed: {str(exc)[:200]}")
-            return
-
-        pref_counts = {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0}
-        supp_counts = {"ANE": 0, "GPU": 0, "CPU": 0}  # union of supported per op
-        op_type_pref: dict[str, dict[str, int]] = {}
-        op_type_ane_supported: dict[str, int] = {}
-
-        def _classify_device(device) -> str:
-            if device is None:
-                return "Unknown"
-            name = type(device).__name__
-            if "NeuralEngine" in name:
-                return "ANE"
-            if "GPU" in name:
-                return "GPU"
-            if "CPU" in name:
-                return "CPU"
-            return "Unknown"
-
-        def _walk_ops(block):
-            for op in block.operations:
-                yield op
-                for inner in op.blocks:
-                    yield from _walk_ops(inner)
-
-        program = plan.model_structure.program
-        if program is None:
-            print("  Model is not an MLProgram; per-op breakdown unavailable.")
-            return
-
-        for fn_name, fn in program.functions.items():
-            for op in _walk_ops(fn.block):
-                usage = plan.get_compute_device_usage_for_mlprogram_operation(op)
-                if usage is None:
-                    pref_counts["Unknown"] += 1
-                    continue
-                pref = _classify_device(usage.preferred_compute_device)
-                pref_counts[pref] += 1
-
-                supp = {_classify_device(d) for d in (usage.supported_compute_devices or [])}
-                for d in supp & {"ANE", "GPU", "CPU"}:
-                    supp_counts[d] += 1
-
-                op_type_pref.setdefault(op.operator_name, {"ANE": 0, "GPU": 0, "CPU": 0, "Unknown": 0})
-                op_type_pref[op.operator_name][pref] += 1
-                if "ANE" in supp:
-                    op_type_ane_supported[op.operator_name] = op_type_ane_supported.get(op.operator_name, 0) + 1
-
-        total = sum(pref_counts.values())
-        if total == 0:
-            print("  No operations found in the program.")
-            return
-
-        print(f"  Total ops: {total}")
-        print(f"  Preferred dispatch (what the runtime would actually pick on this Mac):")
-        for dev in ("ANE", "GPU", "CPU", "Unknown"):
-            c = pref_counts[dev]
-            if c:
-                print(f"    {dev:7s} {c:4d}  ({100 * c / total:5.1f}%)")
-        print(f"  Supported (ops eligible for each device, not necessarily preferred):")
-        for dev in ("ANE", "GPU", "CPU"):
-            c = supp_counts[dev]
-            print(f"    {dev:7s} {c:4d}  ({100 * c / total:5.1f}%)")
-        ane_potential = supp_counts["ANE"] - pref_counts["ANE"]
-        if ane_potential > 0:
-            print(f"  → {ane_potential} ops ({100 * ane_potential / total:.1f}%) are ANE-eligible "
-                  "but not preferred here. iPhone (newer ANE generation) may schedule them on ANE.")
-
-        # Top op types where ANE *isn't* preferred but might be supported
-        gap_types = sorted(
-            (
-                (op_type, op_type_ane_supported.get(op_type, 0), v)
-                for op_type, v in op_type_pref.items()
-                if v.get("ANE", 0) == 0  # not currently going to ANE
-            ),
-            key=lambda x: -(x[1] or sum(x[2].values())),
-        )[:8]
-        if gap_types:
-            print(f"  Top op types NOT preferring ANE:")
-            for op_type, ane_eligible, where in gap_types:
-                bits = " / ".join(f"{d}:{where[d]}" for d in ("GPU", "CPU", "Unknown") if where[d])
-                tag = f"ANE-supported on {ane_eligible}" if ane_eligible else "not ANE-eligible"
-                print(f"    {op_type:35s} ({bits})  [{tag}]")
+    """CoreML ANE report - not applicable for ONNX-only builds."""
+    pass
 
 
 def _ane_report_onnx(onnx_path: str) -> None:
@@ -2231,8 +2040,8 @@ def _ane_report_onnx(onnx_path: str) -> None:
     import onnx
     from collections import Counter
 
-    print(f"\n=== ANE estimate (via CoreML EP): {os.path.basename(onnx_path)} ===")
-    print(f"  ONNX models route through ORT's CoreMLExecutionProvider on iPhone")
+    print(f"\n=== ANE estimate (ONNX on iOS): {os.path.basename(onnx_path)} ===")
+    print(f"  ONNX models can route through ORT's CoreMLExecutionProvider on iPhone")
     print(f"  to reach ANE. The breakdown below is a static op-type estimate.")
 
     model = onnx.load(onnx_path, load_external_data=False)
@@ -2259,29 +2068,14 @@ def _ane_report_onnx(onnx_path: str) -> None:
 
 
 def run_ane_report(output_dir: str) -> None:
-    """Scan `output_dir` for known v4 artifacts and report ANE plans / estimates."""
-    print("\n=== ANE residency report ===")
-    print("Helps answer: 'is converting more of the pipeline to native CoreML")
-    print("(to access ANE) worth the engineering work?'")
-
-    coreml_artifacts = [
-        ("T3Prefill.mlpackage", "v4 prefill"),
-        ("language_model_single.mlpackage", "experimental native CoreML lm"),
-    ]
-    for name, label in coreml_artifacts:
-        path = os.path.join(output_dir, name)
-        if os.path.exists(path):
-            _ane_report_coreml(path)
-        else:
-            print(f"\n  (no {name} at {path} — {label})")
-
-    onnx_dir = os.path.join(output_dir, "onnx")
-    for name in ("language_model_single.onnx", "conditional_decoder_single.onnx"):
-        path = os.path.join(onnx_dir, name)
-        if os.path.exists(path):
-            _ane_report_onnx(path)
-        else:
-            print(f"\n  (no {name} at {path})")
+    """ANE residency report for ONNX models."""
+    print("\n=== ANE residency report (ONNX) ===")
+    onnx_files = [f for f in os.listdir(output_dir) if f.endswith(".onnx")]
+    if not onnx_files:
+        print(f"  No .onnx files found in {output_dir}")
+        return
+    for fname in onnx_files:
+        _ane_report_onnx(os.path.join(output_dir, fname))
 
 
 # ===========================================================================
@@ -2290,8 +2084,8 @@ def run_ane_report(output_dir: str) -> None:
 
 V1_STAGES = ("t3", "s3", "vocoder", "all")
 V4_STAGES = ("prefill", "lm-onnx", "cond-decoder", "v4")
-EXPERIMENTAL_STAGES = ("lm-coreml",)  # native CoreML lm prototype
-ALL_STAGES = V1_STAGES + V4_STAGES + EXPERIMENTAL_STAGES + ("all-v4", "ane-report")
+EXPERIMENTAL_STAGES = ()  # CoreML stages removed
+ALL_STAGES = V1_STAGES + V4_STAGES + ("all-v4", "ane-report")
 
 
 def main():
@@ -2421,9 +2215,9 @@ def main():
 
     # --- v1 stages ---
     if args.stage in ("t3", "all"):
-        convert_t3(v1_model, args.output_dir, validate=args.validate)
+        convert_t3(v1_model, args.output_dir)
     if args.stage in ("s3", "all"):
-        convert_s3(v1_model, args.output_dir, validate=args.validate)
+        convert_s3(v1_model, args.output_dir)
     if args.stage in ("vocoder", "all"):
         extract_vocoder_weights(v1_model, args.output_dir)
     if args.stage == "all":
@@ -2431,8 +2225,8 @@ def main():
 
     if args.stage == "all-v4":
         # Also run v1 stages
-        convert_t3(v1_model, args.output_dir, validate=args.validate)
-        convert_s3(v1_model, args.output_dir, validate=args.validate)
+        convert_t3(v1_model, args.output_dir)
+        convert_s3(v1_model, args.output_dir)
         extract_vocoder_weights(v1_model, args.output_dir)
         extract_tokenizer_and_config(v1_model, args.output_dir)
 
@@ -2458,11 +2252,6 @@ def main():
             cfm_steps=args.cfm_steps,
             optimize_graph=args.optimize_graph,
             quantize=args.quantize,
-        )
-    if args.stage == "lm-coreml":
-        convert_language_model_coreml(
-            v4_model, args.output_dir,
-            validate=args.validate,
         )
 
     print("\n=== Done ===")
