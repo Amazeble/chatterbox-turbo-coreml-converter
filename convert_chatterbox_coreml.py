@@ -34,6 +34,11 @@ import torch.nn as nn
 
 from safetensors.torch import save_file as save_safetensors
 
+try:
+    import coremltools as ct
+except ImportError:
+    ct = None
+
 
 # ---------------------------------------------------------------------------
 # Constants matching Chatterbox Turbo's architecture
