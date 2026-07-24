@@ -364,6 +364,13 @@ def load_pytorch_model_v4(model_dir):
         print("    [Patch] Forcing manual override on nested core layer: tfmr.wte -> 52260")
         t3.tfmr.wte = nn.Embedding(52260, 1024)
 
+    # 3b. Explicitly override fine-tuned vocabulary matrices to match checkpoint shapes
+    print("    [Patch] Manually assigning fine-tuned layer shapes...")
+    t3.text_emb = nn.Embedding(52260, 1024)
+    t3.text_head = nn.Linear(1024, 52260, bias=False)
+    t3.speech_emb = nn.Embedding(6563, 1024)
+    t3.speech_head = nn.Linear(1024, 6563, bias=False)
+
     # 4. Precision-targeted layer rewriting by matching specific checkpoint parameters
     print("  [Patch] Dynamically aligning internal matrices to checkpoint shapes...")
     for name, module in t3.named_modules():
