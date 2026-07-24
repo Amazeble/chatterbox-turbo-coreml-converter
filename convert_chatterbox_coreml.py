@@ -31,7 +31,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import coremltools as ct
+# import coremltools as ct  # DISABLED: Not compatible with Windows
 from safetensors.torch import save_file as save_safetensors
 
 import sys
@@ -573,11 +573,13 @@ def convert_t3(model, output_dir, validate=False):
     if not has_state:
         print("  WARNING: No coreml_update_state — KV cache may not work!")
 
-    if validate:
-        validate_t3_stateful(t3_model, out_path)
+    # validate_t3_stateful disabled - CoreML only, not compatible with Windows
+    # if validate:
+    #     validate_t3_stateful(t3_model, out_path)
 
 
-def validate_t3_stateful(pytorch_model, model_path):
+# validate_t3_stateful disabled - CoreML only, not compatible with Windows
+# def validate_t3_stateful(pytorch_model, model_path):
     """Validate stateful T3 CoreML output matches PyTorch."""
     print("\n  --- T3 Stateful Numerical Validation ---")
 
@@ -2866,10 +2868,10 @@ def run_ane_report(output_dir: str) -> None:
 # MAIN
 # ===========================================================================
 
-V1_STAGES = ("t3", "s3", "vocoder", "all")
+V1_STAGES = ("s3", "vocoder")  # t3 removed - CoreML only
 V4_STAGES = ("prefill", "lm-onnx", "cond-decoder", "v4")
-EXPERIMENTAL_STAGES = ("lm-coreml",)  # native CoreML lm prototype
-ALL_STAGES = V1_STAGES + V4_STAGES + EXPERIMENTAL_STAGES + ("all-v4", "ane-report")
+EXPERIMENTAL_STAGES = ()  # lm-coreml removed - CoreML only
+ALL_STAGES = V1_STAGES + V4_STAGES + ("all-v4", "ane-report")
 
 
 def main():
@@ -2991,8 +2993,7 @@ def main():
         v4_model = load_pytorch_model_v4(args.model_dir)
 
     # --- v1 stages ---
-    if args.stage in ("t3", "all"):
-        convert_t3(v1_model, args.output_dir, validate=args.validate)
+    # t3 stage removed - CoreML only, not compatible with Windows
     if args.stage in ("s3", "all"):
         convert_s3(v1_model, args.output_dir, validate=args.validate)
     if args.stage in ("vocoder", "all"):
@@ -3001,8 +3002,7 @@ def main():
         extract_tokenizer_and_config(v1_model, args.output_dir)
 
     if args.stage == "all-v4":
-        # Also run v1 stages
-        convert_t3(v1_model, args.output_dir, validate=args.validate)
+        # Also run v1 stages (skip t3)
         convert_s3(v1_model, args.output_dir, validate=args.validate)
         extract_vocoder_weights(v1_model, args.output_dir)
         extract_tokenizer_and_config(v1_model, args.output_dir)
@@ -3030,11 +3030,7 @@ def main():
             optimize_graph=args.optimize_graph,
             quantize=args.quantize,
         )
-    if args.stage == "lm-coreml":
-        convert_language_model_coreml(
-            v4_model, args.output_dir,
-            validate=args.validate,
-        )
+    # lm-coreml stage removed - CoreML only, not compatible with Windows
 
     print("\n=== Done ===")
     print(f"Output directory: {args.output_dir}")

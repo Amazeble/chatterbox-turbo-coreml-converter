@@ -1,1 +1,1 @@
-Nothing should be ignored based on the provided file changes. The only modified file is `convert_chatterbox_coreml.py`, which is a Python source file and should not be ignored. There are no build artifacts, dependencies, or temporary files in the change list that would warrant adding ignore rules.
+Nothing should be ignored based on the provided file changes. The only modified file is a Python source file (`convert_chatterbox_coreml.py`), which should not be added to .gitignore.
