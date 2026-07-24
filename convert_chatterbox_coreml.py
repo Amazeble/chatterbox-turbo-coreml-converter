@@ -2329,6 +2329,7 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
                 input_names=["speech_tokens", "speaker_embeddings", "speaker_features"],
                 output_names=["waveform"],
                 dynamic_axes=dynamic_axes,
+                dynamo=False,
                 opset_version=18,
                 do_constant_folding=True,
             )
@@ -2359,7 +2360,7 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
                 output_names=["waveform"],
                 dynamic_shapes=dynamic_shapes,
                 opset_version=20,
-                dynamo=True,
+                dynamo=False,
             )
 
     if mode == "torch29":
