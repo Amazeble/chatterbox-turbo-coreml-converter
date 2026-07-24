@@ -1272,7 +1272,8 @@ def convert_language_model_onnx(model, output_dir, validate=False, reference_dir
     embeds_t = torch.randn(1, 10, GPT2_HIDDEN, dtype=torch.float32) * 0.02
     mask_t = torch.ones(1, past_len + 10, dtype=torch.int64)
     # Re-align position vectors to scale through all 10 processed index allocations
-    pos_t = torch.arange(past_len, past_len + 10, dtype=torch.int64).unsqueeze(0)
+    # Use torch.tensor with explicit list to avoid torch.arange tracing issues
+    pos_t = torch.tensor([list(range(past_len, past_len + 10))], dtype=torch.int64)
     # -------------------------------------------------------------------------------------------------
     
     flat_pkv_t = []
@@ -1557,7 +1558,8 @@ class _T3PrefillWrapper(nn.Module):
 
         embeds = torch.cat([spkr_e, cond_e, text_e, speech_e], dim=1)  # (1, T, H)
         T = embeds.shape[1]
-        position_ids = torch.arange(T, dtype=torch.long, device=embeds.device).unsqueeze(0)
+        # Use tensor from range list to avoid torch.arange tracing issues with Dynamo
+        position_ids = torch.tensor([list(range(T))], dtype=torch.long, device=embeds.device)
         hidden = embeds + self.wpe(position_ids)
         causal_mask = torch.triu(
             torch.full((T, T), -1.0e9, dtype=hidden.dtype, device=hidden.device),
@@ -2077,8 +2079,9 @@ def _patch_chatterbox_for_export():
         weights[1 : K - 1] = 2.0
 
         # IDFT cos/sin basis: angle[k, n] = 2*pi*k*n/N
-        n_idx = torch.arange(n_fft, dtype=magnitude.dtype, device=magnitude.device)
-        k_idx = torch.arange(K, dtype=magnitude.dtype, device=magnitude.device)
+        # Use tensor from range list to avoid torch.arange tracing issues with Dynamo
+        n_idx = torch.tensor(list(range(n_fft)), dtype=magnitude.dtype, device=magnitude.device)
+        k_idx = torch.tensor(list(range(K)), dtype=magnitude.dtype, device=magnitude.device)
         angle = (2.0 * torch.pi / n_fft) * k_idx[:, None] * n_idx[None, :]
         cos_basis = torch.cos(angle)
         sin_basis = torch.sin(angle)
@@ -2204,9 +2207,8 @@ def _patch_chatterbox_for_export_minimal():
         cleaner export).
         """
         H = self.harmonic_num + 1
-        multipliers = torch.arange(
-            1, H + 1, dtype=f0.dtype, device=f0.device
-        ).view(1, H, 1)
+        # Use tensor from range list to avoid torch.arange tracing issues with Dynamo
+        multipliers = torch.tensor(list(range(1, H + 1)), dtype=f0.dtype, device=f0.device).view(1, H, 1)
         # f0: (B, 1, T) -> F_mat: (B, H, T)
         F_mat = (f0 * multipliers) / self.sampling_rate
         theta_mat = 2.0 * _np.pi * torch.cumsum(F_mat, dim=-1)
@@ -2235,8 +2237,9 @@ def _patch_chatterbox_for_export_minimal():
         weights = torch.ones(K, dtype=magnitude.dtype, device=magnitude.device)
         weights[1 : K - 1] = 2.0
 
-        n_idx = torch.arange(n_fft, dtype=magnitude.dtype, device=magnitude.device)
-        k_idx = torch.arange(K, dtype=magnitude.dtype, device=magnitude.device)
+        # Use tensor from range list to avoid torch.arange tracing issues with Dynamo
+        n_idx = torch.tensor(list(range(n_fft)), dtype=magnitude.dtype, device=magnitude.device)
+        k_idx = torch.tensor(list(range(K)), dtype=magnitude.dtype, device=magnitude.device)
         angle = (2.0 * torch.pi / n_fft) * k_idx[:, None] * n_idx[None, :]
         cos_basis = torch.cos(angle)
         sin_basis = torch.sin(angle)
