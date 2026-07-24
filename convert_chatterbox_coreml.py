@@ -1227,13 +1227,16 @@ def _lm_onnx_io_names():
 
 def _lm_onnx_dynamic_axes():
     axes = {
-        "attention_mask": {1: "total_seq_len"},
+        "inputs_embeds": {0: "batch", 1: "sequence_length"},
+        "attention_mask": {0: "batch", 1: "sequence_length"},
+        "position_ids": {0: "batch", 1: "sequence_length"},
+        "logits": {0: "batch", 1: "sequence_length"},
     }
     for i in range(GPT2_LAYERS):
-        axes[f"past_key_values.{i}.key"] = {2: "past_len"}
-        axes[f"past_key_values.{i}.value"] = {2: "past_len"}
-        axes[f"present.{i}.key"] = {2: "total_seq_len"}
-        axes[f"present.{i}.value"] = {2: "total_seq_len"}
+        axes[f"past_key_values.{i}.key"] = {0: "batch", 2: "past_len"}
+        axes[f"past_key_values.{i}.value"] = {0: "batch", 2: "past_len"}
+        axes[f"present.{i}.key"] = {0: "batch", 2: "sequence_length"}
+        axes[f"present.{i}.value"] = {0: "batch", 2: "sequence_length"}
     return axes
 
 
@@ -2324,9 +2327,10 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
         # Legacy TorchScript exporter. Opset 18 (vs HF's 17): need col2im
         # for the manual ISTFT overlap-add via F.fold.
         dynamic_axes = {
-            "speech_tokens": {1: "num_speech_tokens"},
-            "speaker_features": {1: "feature_dim"},
-            "waveform": {1: "num_samples"},
+            "speech_tokens": {0: "batch", 1: "num_speech_tokens"},
+            "speaker_embeddings": {0: "batch"},
+            "speaker_features": {0: "batch", 1: "feature_dim"},
+            "waveform": {0: "batch", 1: "num_samples"},
         }
         with torch.no_grad():
             torch.onnx.export(
@@ -2351,12 +2355,13 @@ def convert_conditional_decoder(model, output_dir, validate=False, reference_dir
         # exporter bug); opset 20 sidesteps both.
         from torch.export import Dim
 
+        batch = Dim("batch", min=1, max=1)
         num_speech_tokens = Dim("num_speech_tokens", min=2, max=4096)
         feat_dim = Dim("feature_dim", min=2, max=4096)
         dynamic_shapes = (
-            {1: num_speech_tokens},
-            None,
-            {1: feat_dim},
+            {0: batch, 1: num_speech_tokens},
+            {0: batch},
+            {0: batch, 1: feat_dim},
         )
         with torch.no_grad():
             torch.onnx.export(
